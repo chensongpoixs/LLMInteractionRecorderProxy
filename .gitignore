@@ -1,0 +1,22 @@
+# Binaries
+proxy-llm
+*.exe
+
+# Data directory (runtime data)
+data/
+
+# Build artifacts
+*.o
+*.a
+*.so
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+/proxy-llm
