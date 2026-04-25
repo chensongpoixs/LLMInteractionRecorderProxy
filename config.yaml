@@ -7,13 +7,14 @@ server:
   tls_key: ""   # Optional: path to TLS key
 
 # LLM Models Configuration
-# models:
-#   - name: "QWen3.6"
-#     base_url: "http://js1.blockelite.cn:57700"
-#     api_key: "${OPENAI_API_KEY}"  # Can use environment variable
-#     model: "Qwen3.6-35B-A3B-Claude-4.6-Opus-Reasoning-Distilled.Q8_0"
-#     timeout: 120s
-#     max_retries: 3
+models:
+  - name: "QWen3.6"
+    # base_url: "http://js1.blockelite.cn:57700"
+    base_url: "http://js2.blockelite.cn:27294"
+    api_key: "${OPENAI_API_KEY}"  # Can use environment variable
+    model: "Qwen3.6-35B-A3B-Claude-4.6-Opus-Reasoning-Distilled.Q8_0"
+    timeout: 120s
+    max_retries: 3
 # models:
 #   - name: "qwen3.6"
 #     base_url: "http://js1.blockelite.cn:57700/v1"
@@ -21,13 +22,13 @@ server:
 #     model: "qwen3.6-35b-a3b-claude-4.6-opus-reasoning-distilled.q8_0"
 #     timeout: 300s
 #     max_retries: 3
-models:
-  - name: "gemma3-4b"
-    base_url: "http://127.0.0.1:11434/v1"
-    api_key: "sk-not-required"  # llama.cpp 默认不需要 API Key
-    model: "gemma-4-26B-A4B-it-Q4_K_M"
-    timeout: 300s
-    max_retries: 3
+# models:
+#   - name: "gemma3-4b"
+#     base_url: "http://127.0.0.1:11434/v1"
+#     api_key: "sk-not-required"  # llama.cpp 默认不需要 API Key
+#     model: "gemma-4-26B-A4B-it-Q4_K_M"
+#     timeout: 300s
+#     max_retries: 3
   # - name: "claude"
   #   base_url: "https://api.anthropic.com/v1"
   #   api_key: "${ANTHROPIC_API_KEY}"

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -395,37 +396,8 @@ func (p *Proxy) handleAnthropicMessages() http.HandlerFunc {
 			}
 		}
 
-		chatMessages := make([]map[string]interface{}, 0, 8)
-		if system, exists := anthropicReq["system"]; exists {
-			systemText := extractAnthropicTextContent(system)
-			if strings.TrimSpace(systemText) != "" {
-				chatMessages = append(chatMessages, map[string]interface{}{
-					"role":    "system",
-					"content": systemText,
-				})
-			}
-		}
-
-		if messagesRaw, exists := anthropicReq["messages"]; exists {
-			if messages, ok := messagesRaw.([]interface{}); ok {
-				for _, m := range messages {
-					msgMap, ok := m.(map[string]interface{})
-					if !ok {
-						continue
-					}
-					role, _ := msgMap["role"].(string)
-					content := extractAnthropicTextContent(msgMap["content"])
-					if strings.TrimSpace(role) == "" {
-						role = "user"
-					}
-					chatMessages = append(chatMessages, map[string]interface{}{
-						"role":    role,
-						"content": content,
-					})
-				}
-			}
-		}
-		chatReq["messages"] = chatMessages
+		chatReq["messages"] = convertAnthropicMessagesToOpenAI(anthropicReq)
+		applyAnthropicToolsToOpenAI(anthropicReq, chatReq)
 
 		translatedModelName := modelName
 		if cfg := p.getModelByProxyName(modelName); cfg != nil {
@@ -514,6 +486,7 @@ func (p *Proxy) handleAnthropicMessages() http.HandlerFunc {
 
 		textContent := ""
 		stopReason := "end_turn"
+		toolUseBlocks := make([]map[string]interface{}, 0, 4)
 		if choicesRaw, exists := openAIResp["choices"]; exists {
 			if choices, ok := choicesRaw.([]interface{}); ok && len(choices) > 0 {
 				if choice, ok := choices[0].(map[string]interface{}); ok {
@@ -531,9 +504,13 @@ func (p *Proxy) handleAnthropicMessages() http.HandlerFunc {
 						if content, ok := message["content"].(string); ok {
 							textContent = content
 						}
+						toolUseBlocks = extractToolUseBlocksFromOpenAIMessage(message)
 					}
 				}
 			}
+		}
+		if len(toolUseBlocks) > 0 && stopReason != "max_tokens" {
+			stopReason = "tool_use"
 		}
 
 		usage := map[string]interface{}{
@@ -551,17 +528,24 @@ func (p *Proxy) handleAnthropicMessages() http.HandlerFunc {
 			}
 		}
 
+		contentBlocks := make([]map[string]interface{}, 0, 1+len(toolUseBlocks))
+		if strings.TrimSpace(textContent) != "" {
+			contentBlocks = append(contentBlocks, map[string]interface{}{
+				"type": "text",
+				"text": textContent,
+			})
+		}
+		contentBlocks = append(contentBlocks, toolUseBlocks...)
+		if len(contentBlocks) == 0 {
+			contentBlocks = append(contentBlocks, map[string]interface{}{"type": "text", "text": ""})
+		}
+
 		anthropicResp := map[string]interface{}{
 			"id":    "msg_" + nextUniqueID(),
 			"type":  "message",
 			"role":  "assistant",
 			"model": modelName,
-			"content": []map[string]interface{}{
-				{
-					"type": "text",
-					"text": textContent,
-				},
-			},
+			"content": contentBlocks,
 			"stop_reason":   stopReason,
 			"stop_sequence": nil,
 			"usage":         usage,
@@ -651,6 +635,14 @@ func (p *Proxy) handleAnthropicMessagesStream(w http.ResponseWriter, r *http.Req
 	inputTokens := 0
 	outputTokens := 0
 	aggregatedText := strings.Builder{}
+	textBlockStarted := false
+	type streamedToolCall struct {
+		ID        string
+		Name      string
+		Arguments strings.Builder
+	}
+	toolCalls := map[int]*streamedToolCall{}
+	toolCallOrder := make([]int, 0, 4)
 
 	writeEvent := func(eventName string, payload map[string]interface{}) {
 		data, _ := json.Marshal(payload)
@@ -673,15 +665,6 @@ func (p *Proxy) handleAnthropicMessagesStream(w http.ResponseWriter, r *http.Req
 				"input_tokens":  inputTokens,
 				"output_tokens": outputTokens,
 			},
-		},
-	})
-
-	writeEvent("content_block_start", map[string]interface{}{
-		"type":  "content_block_start",
-		"index": 0,
-		"content_block": map[string]interface{}{
-			"type": "text",
-			"text": "",
 		},
 	})
 
@@ -749,6 +732,17 @@ func (p *Proxy) handleAnthropicMessagesStream(w http.ResponseWriter, r *http.Req
 					if deltaRaw, exists := choice["delta"]; exists {
 						if delta, ok := deltaRaw.(map[string]interface{}); ok {
 							if text, ok := delta["content"].(string); ok && text != "" {
+								if !textBlockStarted {
+									writeEvent("content_block_start", map[string]interface{}{
+										"type":  "content_block_start",
+										"index": 0,
+										"content_block": map[string]interface{}{
+											"type": "text",
+											"text": "",
+										},
+									})
+									textBlockStarted = true
+								}
 								aggregatedText.WriteString(text)
 								writeEvent("content_block_delta", map[string]interface{}{
 									"type":  "content_block_delta",
@@ -758,6 +752,41 @@ func (p *Proxy) handleAnthropicMessagesStream(w http.ResponseWriter, r *http.Req
 										"text": text,
 									},
 								})
+							}
+							if tcRaw, hasTC := delta["tool_calls"]; hasTC {
+								if tcArr, ok := tcRaw.([]interface{}); ok {
+									for i, t := range tcArr {
+										tcMap, ok := t.(map[string]interface{})
+										if !ok {
+											continue
+										}
+										idx := i
+										if idxRaw, ok := tcMap["index"]; ok {
+											if iv, ok := asInt(idxRaw); ok {
+												idx = iv
+											}
+										}
+										entry, exists := toolCalls[idx]
+										if !exists {
+											entry = &streamedToolCall{}
+											toolCalls[idx] = entry
+											toolCallOrder = append(toolCallOrder, idx)
+										}
+										if id, ok := tcMap["id"].(string); ok && id != "" {
+											entry.ID = id
+										}
+										if fnRaw, ok := tcMap["function"]; ok {
+											if fn, ok := fnRaw.(map[string]interface{}); ok {
+												if name, ok := fn["name"].(string); ok && name != "" {
+													entry.Name = name
+												}
+												if args, ok := fn["arguments"].(string); ok && args != "" {
+													entry.Arguments.WriteString(args)
+												}
+											}
+										}
+									}
+								}
 							}
 						}
 					}
@@ -771,10 +800,55 @@ func (p *Proxy) handleAnthropicMessagesStream(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	writeEvent("content_block_stop", map[string]interface{}{
-		"type":  "content_block_stop",
-		"index": 0,
-	})
+	if textBlockStarted {
+		writeEvent("content_block_stop", map[string]interface{}{
+			"type":  "content_block_stop",
+			"index": 0,
+		})
+	}
+	if len(toolCallOrder) > 0 && stopReason != "max_tokens" {
+		stopReason = "tool_use"
+		sort.Ints(toolCallOrder)
+		for i, idx := range toolCallOrder {
+			tc := toolCalls[idx]
+			if tc == nil {
+				continue
+			}
+			toolID := tc.ID
+			if toolID == "" {
+				toolID = "toolu_" + nextUniqueID()
+			}
+			toolName := tc.Name
+			if toolName == "" {
+				toolName = "unknown_tool"
+			}
+			writeEvent("content_block_start", map[string]interface{}{
+				"type":  "content_block_start",
+				"index": i + 1,
+				"content_block": map[string]interface{}{
+					"type":  "tool_use",
+					"id":    toolID,
+					"name":  toolName,
+					"input": map[string]interface{}{},
+				},
+			})
+			argStr := strings.TrimSpace(tc.Arguments.String())
+			if argStr != "" {
+				writeEvent("content_block_delta", map[string]interface{}{
+					"type":  "content_block_delta",
+					"index": i + 1,
+					"delta": map[string]interface{}{
+						"type":         "input_json_delta",
+						"partial_json": argStr,
+					},
+				})
+			}
+			writeEvent("content_block_stop", map[string]interface{}{
+				"type":  "content_block_stop",
+				"index": i + 1,
+			})
+		}
+	}
 
 	writeEvent("message_delta", map[string]interface{}{
 		"type": "message_delta",
@@ -1369,6 +1443,249 @@ func (w *noWriteStatusCapturingWriter) Write(b []byte) (int, error) {
 		return len(b), nil // Suppress writing - we'll provide our own response
 	}
 	return w.ResponseWriter.Write(b)
+}
+
+func convertAnthropicMessagesToOpenAI(req map[string]interface{}) []map[string]interface{} {
+	out := make([]map[string]interface{}, 0, 16)
+	if system, exists := req["system"]; exists {
+		systemText := extractAnthropicTextContent(system)
+		if strings.TrimSpace(systemText) != "" {
+			out = append(out, map[string]interface{}{
+				"role":    "system",
+				"content": systemText,
+			})
+		}
+	}
+
+	messagesRaw, exists := req["messages"]
+	if !exists {
+		return out
+	}
+	messages, ok := messagesRaw.([]interface{})
+	if !ok {
+		return out
+	}
+	for _, m := range messages {
+		msgMap, ok := m.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		role, _ := msgMap["role"].(string)
+		if strings.TrimSpace(role) == "" {
+			role = "user"
+		}
+		content := msgMap["content"]
+
+		switch role {
+		case "assistant":
+			textContent := extractAnthropicTextContent(content)
+			toolCalls := extractOpenAIToolCallsFromAnthropicContent(content)
+			msg := map[string]interface{}{
+				"role":    "assistant",
+				"content": textContent,
+			}
+			if len(toolCalls) > 0 {
+				msg["tool_calls"] = toolCalls
+			}
+			out = append(out, msg)
+		case "user":
+			textContent, toolResults := extractUserTextAndToolResults(content)
+			if strings.TrimSpace(textContent) != "" {
+				out = append(out, map[string]interface{}{
+					"role":    "user",
+					"content": textContent,
+				})
+			}
+			out = append(out, toolResults...)
+		default:
+			out = append(out, map[string]interface{}{
+				"role":    role,
+				"content": extractAnthropicTextContent(content),
+			})
+		}
+	}
+	return out
+}
+
+func applyAnthropicToolsToOpenAI(req map[string]interface{}, chatReq map[string]interface{}) {
+	toolsRaw, exists := req["tools"]
+	if exists {
+		if arr, ok := toolsRaw.([]interface{}); ok {
+			tools := make([]map[string]interface{}, 0, len(arr))
+			for _, item := range arr {
+				toolMap, ok := item.(map[string]interface{})
+				if !ok {
+					continue
+				}
+				name, _ := toolMap["name"].(string)
+				if strings.TrimSpace(name) == "" {
+					continue
+				}
+				fn := map[string]interface{}{
+					"name": name,
+				}
+				if desc, ok := toolMap["description"].(string); ok && strings.TrimSpace(desc) != "" {
+					fn["description"] = desc
+				}
+				if schema, exists := toolMap["input_schema"]; exists {
+					fn["parameters"] = schema
+				}
+				tools = append(tools, map[string]interface{}{
+					"type":     "function",
+					"function": fn,
+				})
+			}
+			if len(tools) > 0 {
+				chatReq["tools"] = tools
+			}
+		}
+	}
+
+	if tcRaw, exists := req["tool_choice"]; exists {
+		switch tc := tcRaw.(type) {
+		case string:
+			chatReq["tool_choice"] = tc
+		case map[string]interface{}:
+			t, _ := tc["type"].(string)
+			switch t {
+			case "auto":
+				chatReq["tool_choice"] = "auto"
+			case "any":
+				chatReq["tool_choice"] = "required"
+			case "tool":
+				name, _ := tc["name"].(string)
+				if strings.TrimSpace(name) != "" {
+					chatReq["tool_choice"] = map[string]interface{}{
+						"type": "function",
+						"function": map[string]interface{}{
+							"name": name,
+						},
+					}
+				}
+			}
+		}
+	}
+}
+
+func extractOpenAIToolCallsFromAnthropicContent(content interface{}) []map[string]interface{} {
+	blocks, ok := content.([]interface{})
+	if !ok {
+		return nil
+	}
+	out := make([]map[string]interface{}, 0, 4)
+	for _, b := range blocks {
+		block, ok := b.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		blockType, _ := block["type"].(string)
+		if blockType != "tool_use" {
+			continue
+		}
+		id, _ := block["id"].(string)
+		name, _ := block["name"].(string)
+		if strings.TrimSpace(name) == "" {
+			continue
+		}
+		args := "{}"
+		if input, exists := block["input"]; exists {
+			if bs, err := json.Marshal(input); err == nil {
+				args = string(bs)
+			}
+		}
+		out = append(out, map[string]interface{}{
+			"id":   id,
+			"type": "function",
+			"function": map[string]interface{}{
+				"name":      name,
+				"arguments": args,
+			},
+		})
+	}
+	return out
+}
+
+func extractUserTextAndToolResults(content interface{}) (string, []map[string]interface{}) {
+	blocks, ok := content.([]interface{})
+	if !ok {
+		return extractAnthropicTextContent(content), nil
+	}
+	textParts := make([]string, 0, len(blocks))
+	toolResults := make([]map[string]interface{}, 0, 4)
+	for _, b := range blocks {
+		block, ok := b.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		blockType, _ := block["type"].(string)
+		switch blockType {
+		case "text", "":
+			if text, ok := block["text"].(string); ok && strings.TrimSpace(text) != "" {
+				textParts = append(textParts, text)
+			}
+		case "tool_result":
+			toolID, _ := block["tool_use_id"].(string)
+			if strings.TrimSpace(toolID) == "" {
+				continue
+			}
+			toolResults = append(toolResults, map[string]interface{}{
+				"role":         "tool",
+				"tool_call_id": toolID,
+				"content":      extractAnthropicTextContent(block["content"]),
+			})
+		}
+	}
+	return strings.Join(textParts, "\n"), toolResults
+}
+
+func extractToolUseBlocksFromOpenAIMessage(message map[string]interface{}) []map[string]interface{} {
+	raw, exists := message["tool_calls"]
+	if !exists {
+		return nil
+	}
+	arr, ok := raw.([]interface{})
+	if !ok {
+		return nil
+	}
+	out := make([]map[string]interface{}, 0, len(arr))
+	for _, item := range arr {
+		tc, ok := item.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		fnRaw, ok := tc["function"]
+		if !ok {
+			continue
+		}
+		fn, ok := fnRaw.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		name, _ := fn["name"].(string)
+		if strings.TrimSpace(name) == "" {
+			continue
+		}
+		id, _ := tc["id"].(string)
+		if strings.TrimSpace(id) == "" {
+			id = "toolu_" + nextUniqueID()
+		}
+		input := map[string]interface{}{}
+		if argsRaw, ok := fn["arguments"].(string); ok && strings.TrimSpace(argsRaw) != "" {
+			var parsed map[string]interface{}
+			if err := json.Unmarshal([]byte(argsRaw), &parsed); err == nil {
+				input = parsed
+			} else {
+				input = map[string]interface{}{"raw": argsRaw}
+			}
+		}
+		out = append(out, map[string]interface{}{
+			"type":  "tool_use",
+			"id":    id,
+			"name":  name,
+			"input": input,
+		})
+	}
+	return out
 }
 
 // extractAnthropicTextContent reads Anthropic content blocks and returns merged text.
