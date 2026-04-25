@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -108,7 +109,20 @@ func (l *Logger) SaveStreamChunk(chunk *ResponseStream) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	fileName := filepath.Join(l.dir, "streams", fmt.Sprintf("%s_%s", chunk.SessionID, time.Now().Format("20060102")))
+	dateStr := chunk.Timestamp.Format("20060102")
+	if dateStr == "00010101" {
+		dateStr = time.Now().Format("20060102")
+	}
+	streamDir := filepath.Join(l.dir, dateStr, "streams")
+	if err := os.MkdirAll(streamDir, 0755); err != nil {
+		return err
+	}
+
+	sessionID := chunk.SessionID
+	if sessionID == "" {
+		sessionID = "default"
+	}
+	fileName := filepath.Join(streamDir, fmt.Sprintf("%s_%s", sessionID, dateStr))
 
 	file, err := os.OpenFile(fileName+".jsonl", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	if err != nil {
@@ -127,25 +141,37 @@ func (l *Logger) SaveStreamChunk(chunk *ResponseStream) error {
 
 // ListLogs returns all log files matching a pattern
 func (l *Logger) ListLogs(sessionID, date string) ([]string, error) {
-	pattern := filepath.Join(l.dir, "*")
-	if sessionID != "" {
-		pattern = filepath.Join(l.dir, sessionID+"*")
-	}
-	if date != "" {
-		pattern = filepath.Join(l.dir, "*"+date+"*")
-	}
+	var files []string
+	err := filepath.WalkDir(l.dir, func(path string, d os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if d.IsDir() {
+			return nil
+		}
 
-	matches, err := filepath.Glob(pattern)
+		ext := filepath.Ext(path)
+		if ext != ".jsonl" && ext != ".gz" {
+			return nil
+		}
+		if ext == ".gz" && !strings.HasSuffix(path, ".jsonl.gz") {
+			return nil
+		}
+
+		base := filepath.Base(path)
+		full := filepath.ToSlash(path)
+		if sessionID != "" && !strings.Contains(base, sessionID) {
+			return nil
+		}
+		if date != "" && !strings.Contains(full, date) {
+			return nil
+		}
+
+		files = append(files, path)
+		return nil
+	})
 	if err != nil {
 		return nil, err
-	}
-
-	var files []string
-	for _, m := range matches {
-		ext := filepath.Ext(m)
-		if ext == ".jsonl" || ext == ".jsonl.gz" {
-			files = append(files, m)
-		}
 	}
 
 	return files, nil
@@ -189,22 +215,26 @@ func (l *Logger) ReadLog(filePath string) ([]json.RawMessage, error) {
 
 func (l *Logger) buildFileName(req *RequestLog) string {
 	dateStr := req.Timestamp.Format("20060102")
-	sessionDir := req.SessionID
-	if sessionDir == "" {
-		sessionDir = "default"
+	if dateStr == "00010101" {
+		dateStr = time.Now().Format("20060102")
 	}
 
-	dir := filepath.Join(l.dir, sessionDir)
+	// Store logs by date directory for easier investigation and retention.
+	dir := filepath.Join(l.dir, dateStr)
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		dir = filepath.Join(l.dir, "default")
 		os.MkdirAll(dir, 0755)
 	}
 
-	timestamp := req.Timestamp.Format("150405")
+	sessionID := req.SessionID
+	if sessionID == "" {
+		sessionID = "default"
+	}
+
 	extension := ".jsonl"
 	if l.gzip {
 		extension = ".jsonl.gz"
 	}
 
-	return filepath.Join(dir, fmt.Sprintf("%s_%s_%s%s", req.SessionID, dateStr, timestamp, extension))
+	return filepath.Join(dir, fmt.Sprintf("%s_%s%s", sessionID, dateStr, extension))
 }

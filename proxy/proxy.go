@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -8,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"proxy-llm/config"
@@ -15,15 +17,24 @@ import (
 	"proxy-llm/storage"
 )
 
+// idSeq is combined with time.Now().UnixNano() so req/up IDs stay unique when the clock
+// returns the same value twice (e.g. two concurrent POSTs on Windows) — that looked like
+// "one [REQ:...] but two upstream calls" in logs.
+var idSeq atomic.Uint64
+
+func nextUniqueID() string {
+	return fmt.Sprintf("%d_%d", time.Now().UnixNano(), idSeq.Add(1))
+}
+
 // Proxy handles forwarding requests to LLM APIs
 type Proxy struct {
-	server   *http.Server
-	clients  map[string]*http.Client
-	config   *config.Config
-	logger   *storage.Logger
-	handler  *Handler
-	metrics  *Metrics
-	authMw   func(http.HandlerFunc) http.HandlerFunc
+	server    *http.Server
+	clients   map[string]*http.Client
+	config    *config.Config
+	logger    *storage.Logger
+	handler   *Handler
+	metrics   *Metrics
+	authMw    func(http.HandlerFunc) http.HandlerFunc
 	appLogger *logger.Logger
 }
 
@@ -62,6 +73,7 @@ func New(cfg *config.Config, storageLogger *storage.Logger, metrics *Metrics, ap
 	// Register proxy routes
 	appLogger.Info("Registering proxy routes...")
 	mux.HandleFunc("/v1/chat/completions", proxy.handleRequest("chat/completions"))
+	mux.HandleFunc("/v1/messages", proxy.handleAnthropicMessages())
 	mux.HandleFunc("/v1/completions", proxy.handleRequest("completions"))
 	mux.HandleFunc("/v1/embeddings", proxy.handleRequest("embeddings"))
 	// llama.cpp llama-server compatible endpoint
@@ -116,7 +128,7 @@ func New(cfg *config.Config, storageLogger *storage.Logger, metrics *Metrics, ap
 
 // generateRequestID creates a unique request ID for tracking
 func (p *Proxy) generateRequestID() string {
-	return fmt.Sprintf("req_%d", time.Now().UnixNano())
+	return "req_" + nextUniqueID()
 }
 
 // handleRequest creates an HTTP handler for a specific endpoint
@@ -142,6 +154,9 @@ func (p *Proxy) handleRequest(endpoint string) http.HandlerFunc {
 		}
 		r.Body.Close()
 		requestLogger.Info("Request body read: %d bytes", len(body))
+		if p.shouldLogUpstreamHTTP() {
+			p.logHTTPClientToProxy(requestLogger, "("+endpoint+")", r, body)
+		}
 
 		// Parse request body
 		requestLogger.Debug("Parsing request body...")
@@ -206,39 +221,84 @@ func (p *Proxy) handleRequest(endpoint string) http.HandlerFunc {
 		requestLogger.Info("Stream mode: %v", isStream)
 
 		// Execute request
+		if err := r.Context().Err(); err != nil {
+			requestLogger.Warn("Client disconnected before upstream call: %v", err)
+			return
+		}
 		requestLogger.Debug("Looking up HTTP client for model: %s", modelName)
-		var client *http.Client
-		if c, exists := p.clients[modelName]; exists {
-			client = c
+		client := p.getHTTPClient(modelName)
+		if _, exists := p.clients[modelName]; exists {
 			requestLogger.Debug("Using client for model: %s", modelName)
 		} else {
-			client = p.clients["default"]
-			requestLogger.Debug("Falling back to default client")
+			requestLogger.Debug("Falling back to first configured model client")
 		}
 
 		// Handle streaming vs non-streaming
 		if isStream && p.config.Proxy.EnableStream {
+			uCall := "up_" + nextUniqueID()
+			uStart := time.Now()
+			retryCount := r.Header.Get("X-Stainless-Retry-Count")
 			requestLogger.Info("=== Starting streaming mode ===")
-			p.handleStreaming(w, r, proxyReq, client, reqBody, modelName, start, endpoint, requestLogger)
+			requestLogger.Info(
+				"Upstream call start: call_id=%s endpoint=%s target=%s stream=%v remote=%s retry_count=%s",
+				uCall, endpoint, targetURL, isStream, r.RemoteAddr, retryCount,
+			)
+			if p.shouldLogUpstreamHTTP() {
+				p.logHTTPOutgoingUpstream(requestLogger, uCall, proxyReq, body)
+			}
+			p.handleStreaming(w, r, proxyReq, client, reqBody, modelName, start, endpoint, requestLogger, uCall, uStart, body)
 			return
 		}
 
 		// Non-streaming response
+		upstreamCallID := "up_" + nextUniqueID()
+		upstreamStart := time.Now()
+		retryCount := r.Header.Get("X-Stainless-Retry-Count")
+		requestLogger.Info(
+			"Upstream call start: call_id=%s endpoint=%s target=%s stream=%v retry_count=%s",
+			upstreamCallID, endpoint, targetURL, isStream, retryCount,
+		)
+		if p.shouldLogUpstreamHTTP() {
+			p.logHTTPOutgoingUpstream(requestLogger, upstreamCallID, proxyReq, body)
+		}
 		requestLogger.Info("=== Sending request to LLM API ===")
 		resp, err := client.Do(proxyReq)
 		if err != nil {
+			if r.Context().Err() != nil {
+				requestLogger.Warn(
+					"Upstream call canceled: call_id=%s reason=client_disconnected elapsed=%v err=%v",
+					upstreamCallID, time.Since(upstreamStart), r.Context().Err(),
+				)
+				return
+			}
+			requestLogger.Error(
+				"Upstream call failed: call_id=%s elapsed=%v err=%v",
+				upstreamCallID, time.Since(upstreamStart), err,
+			)
 			requestLogger.Error("Proxy request failed: %v", err)
 			p.logRequest(reqBody, modelName, endpoint, start, 500, nil, true, err.Error(), nil, requestLogger)
 			http.Error(w, "Proxy error: "+err.Error(), http.StatusBadGateway)
 			return
 		}
+		requestLogger.Info(
+			"Upstream call success: call_id=%s status=%d elapsed=%v",
+			upstreamCallID, resp.StatusCode, time.Since(upstreamStart),
+		)
 		requestLogger.Info("LLM API responded: status=%d", resp.StatusCode)
 		defer resp.Body.Close()
 
 		// Read response body
+		if err := r.Context().Err(); err != nil {
+			requestLogger.Warn("Client disconnected before reading upstream body: %v", err)
+			return
+		}
 		requestLogger.Debug("Reading LLM API response body...")
 		respBody, err := io.ReadAll(resp.Body)
 		if err != nil {
+			if r.Context().Err() != nil {
+				requestLogger.Warn("Client disconnected during upstream body read: %v", r.Context().Err())
+				return
+			}
 			requestLogger.Error("Failed to read LLM API response: %v", err)
 			p.logRequest(reqBody, modelName, endpoint, start, resp.StatusCode, nil, false, err.Error(), nil, requestLogger)
 			http.Error(w, "Failed to read response", http.StatusBadGateway)
@@ -256,6 +316,9 @@ func (p *Proxy) handleRequest(endpoint string) http.HandlerFunc {
 		if p.appLogger.ShouldLogResponseBody() && len(respParsed) > 0 {
 			respStr, _ := json.Marshal(respParsed)
 			requestLogger.Debug("LLM API response: %s", string(respStr))
+		}
+		if p.shouldLogUpstreamHTTP() {
+			p.logHTTPUpstreamResponseFull(requestLogger, upstreamCallID, resp, respBody)
 		}
 		p.logRequest(reqBody, modelName, endpoint, start, resp.StatusCode, respBody, false, "", tokensUsed, requestLogger)
 
@@ -275,16 +338,502 @@ func (p *Proxy) handleRequest(endpoint string) http.HandlerFunc {
 	}
 }
 
+// handleAnthropicMessages adapts Anthropic Messages API requests to OpenAI chat/completions
+func (p *Proxy) handleAnthropicMessages() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		reqID := p.generateRequestID()
+		requestLogger := p.appLogger.WithRequestID(reqID)
+		start := time.Now()
+
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, "Failed to read request body", http.StatusBadRequest)
+			return
+		}
+		r.Body.Close()
+		if p.shouldLogUpstreamHTTP() {
+			p.logHTTPClientToProxy(requestLogger, "(/v1/messages)", r, body)
+		}
+
+		var anthropicReq map[string]interface{}
+		if err := json.Unmarshal(body, &anthropicReq); err != nil {
+			http.Error(w, "Invalid request body", http.StatusBadRequest)
+			return
+		}
+
+		modelName := "default"
+		if model, ok := anthropicReq["model"].(string); ok && model != "" {
+			modelName = model
+		}
+
+		// Convert Anthropic messages payload into OpenAI chat/completions payload.
+		chatReq := map[string]interface{}{
+			"model":  modelName,
+			"stream": false,
+		}
+
+		if maxTokens, exists := anthropicReq["max_tokens"]; exists {
+			chatReq["max_tokens"] = maxTokens
+		}
+		if temperature, exists := anthropicReq["temperature"]; exists {
+			chatReq["temperature"] = temperature
+		}
+		if topP, exists := anthropicReq["top_p"]; exists {
+			chatReq["top_p"] = topP
+		}
+		if stream, exists := anthropicReq["stream"]; exists {
+			if s, ok := stream.(bool); ok {
+				chatReq["stream"] = s
+			}
+		}
+
+		chatMessages := make([]map[string]interface{}, 0, 8)
+		if system, exists := anthropicReq["system"]; exists {
+			systemText := extractAnthropicTextContent(system)
+			if strings.TrimSpace(systemText) != "" {
+				chatMessages = append(chatMessages, map[string]interface{}{
+					"role":    "system",
+					"content": systemText,
+				})
+			}
+		}
+
+		if messagesRaw, exists := anthropicReq["messages"]; exists {
+			if messages, ok := messagesRaw.([]interface{}); ok {
+				for _, m := range messages {
+					msgMap, ok := m.(map[string]interface{})
+					if !ok {
+						continue
+					}
+					role, _ := msgMap["role"].(string)
+					content := extractAnthropicTextContent(msgMap["content"])
+					if strings.TrimSpace(role) == "" {
+						role = "user"
+					}
+					chatMessages = append(chatMessages, map[string]interface{}{
+						"role":    role,
+						"content": content,
+					})
+				}
+			}
+		}
+		chatReq["messages"] = chatMessages
+
+		translatedModelName := modelName
+		if cfg := p.getModelByProxyName(modelName); cfg != nil {
+			translatedModelName = cfg.ModelName
+		}
+		if translatedModelName != modelName {
+			chatReq["model"] = translatedModelName
+		}
+
+		if stream, _ := chatReq["stream"].(bool); stream && p.config.Proxy.EnableStream {
+			p.handleAnthropicMessagesStream(w, r, chatReq, modelName, start, requestLogger)
+			return
+		}
+
+		reqBytes, _ := json.Marshal(chatReq)
+		targetURL := fmt.Sprintf("%s/%s", p.getModelBaseURL(modelName), "chat/completions")
+		proxyReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, targetURL, bytes.NewReader(reqBytes))
+		if err != nil {
+			http.Error(w, "Failed to create proxy request", http.StatusInternalServerError)
+			return
+		}
+		proxyReq.Header.Set("Authorization", "Bearer "+p.getAPIKey(modelName))
+		proxyReq.Header.Set("Content-Type", "application/json")
+
+		client := p.getHTTPClient(modelName)
+
+		upstreamCallID := "up_" + nextUniqueID()
+		upstreamStart := time.Now()
+		retryCount := r.Header.Get("X-Stainless-Retry-Count")
+		requestLogger.Info(
+			"Upstream call start: call_id=%s endpoint=messages target=%s stream=false remote=%s retry_count=%s",
+			upstreamCallID, targetURL, r.RemoteAddr, retryCount,
+		)
+		if p.shouldLogUpstreamHTTP() {
+			p.logHTTPOutgoingUpstream(requestLogger, upstreamCallID, proxyReq, reqBytes)
+		}
+
+		resp, err := client.Do(proxyReq)
+		if err != nil {
+			if r.Context().Err() != nil {
+				requestLogger.Warn(
+					"Upstream call canceled: call_id=%s endpoint=messages reason=client_disconnected elapsed=%v err=%v",
+					upstreamCallID, time.Since(upstreamStart), r.Context().Err(),
+				)
+				return
+			}
+			requestLogger.Error(
+				"Upstream call failed: call_id=%s endpoint=messages elapsed=%v err=%v",
+				upstreamCallID, time.Since(upstreamStart), err,
+			)
+			p.logRequest(chatReq, modelName, "messages", start, 500, nil, false, err.Error(), nil, requestLogger)
+			http.Error(w, "Proxy error: "+err.Error(), http.StatusBadGateway)
+			return
+		}
+		requestLogger.Info(
+			"Upstream call success: call_id=%s endpoint=messages status=%d elapsed=%v",
+			upstreamCallID, resp.StatusCode, time.Since(upstreamStart),
+		)
+		defer resp.Body.Close()
+
+		respBody, err := io.ReadAll(resp.Body)
+		if err != nil {
+			if r.Context().Err() != nil {
+				requestLogger.Warn("Client disconnected during /v1/messages upstream body read: %v", r.Context().Err())
+				return
+			}
+			p.logRequest(chatReq, modelName, "messages", start, resp.StatusCode, nil, false, err.Error(), nil, requestLogger)
+			http.Error(w, "Failed to read response", http.StatusBadGateway)
+			return
+		}
+		if p.shouldLogUpstreamHTTP() {
+			p.logHTTPUpstreamResponseFull(requestLogger, upstreamCallID, resp, respBody)
+		}
+
+		normalizedBody := p.normalizeTokens(respBody)
+		var openAIResp map[string]interface{}
+		if err := json.Unmarshal(normalizedBody, &openAIResp); err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(resp.StatusCode)
+			w.Write(normalizedBody)
+			return
+		}
+
+		tokensUsed := p.extractTokens(openAIResp)
+		p.logRequest(chatReq, modelName, "messages", start, resp.StatusCode, normalizedBody, false, "", tokensUsed, requestLogger)
+
+		textContent := ""
+		stopReason := "end_turn"
+		if choicesRaw, exists := openAIResp["choices"]; exists {
+			if choices, ok := choicesRaw.([]interface{}); ok && len(choices) > 0 {
+				if choice, ok := choices[0].(map[string]interface{}); ok {
+					if finishReason, ok := choice["finish_reason"].(string); ok {
+						switch finishReason {
+						case "length":
+							stopReason = "max_tokens"
+						case "stop":
+							stopReason = "end_turn"
+						default:
+							stopReason = "end_turn"
+						}
+					}
+					if message, ok := choice["message"].(map[string]interface{}); ok {
+						if content, ok := message["content"].(string); ok {
+							textContent = content
+						}
+					}
+				}
+			}
+		}
+
+		usage := map[string]interface{}{
+			"input_tokens":  0,
+			"output_tokens": 0,
+		}
+		if usageRaw, exists := openAIResp["usage"]; exists {
+			if usageMap, ok := usageRaw.(map[string]interface{}); ok {
+				if inVal, exists := usageMap["input_tokens"]; exists {
+					usage["input_tokens"] = inVal
+				}
+				if outVal, exists := usageMap["output_tokens"]; exists {
+					usage["output_tokens"] = outVal
+				}
+			}
+		}
+
+		anthropicResp := map[string]interface{}{
+			"id":    "msg_" + nextUniqueID(),
+			"type":  "message",
+			"role":  "assistant",
+			"model": modelName,
+			"content": []map[string]interface{}{
+				{
+					"type": "text",
+					"text": textContent,
+				},
+			},
+			"stop_reason":   stopReason,
+			"stop_sequence": nil,
+			"usage":         usage,
+		}
+
+		out, _ := json.Marshal(anthropicResp)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(resp.StatusCode)
+		w.Write(out)
+	}
+}
+
+// handleAnthropicMessagesStream adapts OpenAI-style SSE to Anthropic Messages SSE events.
+func (p *Proxy) handleAnthropicMessagesStream(w http.ResponseWriter, r *http.Request, chatReq map[string]interface{}, modelName string, start time.Time, requestLogger *logger.Logger) {
+	reqBytes, _ := json.Marshal(chatReq)
+	targetURL := fmt.Sprintf("%s/%s", p.getModelBaseURL(modelName), "chat/completions")
+	proxyReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, targetURL, bytes.NewReader(reqBytes))
+	if err != nil {
+		http.Error(w, "Failed to create proxy request", http.StatusInternalServerError)
+		return
+	}
+	proxyReq.Header.Set("Authorization", "Bearer "+p.getAPIKey(modelName))
+	proxyReq.Header.Set("Content-Type", "application/json")
+	proxyReq.Header.Set("Accept", "text/event-stream")
+
+	client := p.getHTTPClient(modelName)
+
+	upstreamCallID := "up_" + nextUniqueID()
+	upstreamStart := time.Now()
+	retryCount := r.Header.Get("X-Stainless-Retry-Count")
+	requestLogger.Info(
+		"Upstream call start: call_id=%s endpoint=messages target=%s stream=true remote=%s retry_count=%s",
+		upstreamCallID, targetURL, r.RemoteAddr, retryCount,
+	)
+	if p.shouldLogUpstreamHTTP() {
+		p.logHTTPOutgoingUpstream(requestLogger, upstreamCallID, proxyReq, reqBytes)
+	}
+	resp, err := client.Do(proxyReq)
+	if err != nil {
+		if r.Context().Err() != nil {
+			requestLogger.Warn(
+				"Upstream call canceled: call_id=%s endpoint=messages reason=client_disconnected elapsed=%v err=%v",
+				upstreamCallID, time.Since(upstreamStart), r.Context().Err(),
+			)
+			return
+		}
+		requestLogger.Error(
+			"Upstream call failed: call_id=%s endpoint=messages elapsed=%v err=%v",
+			upstreamCallID, time.Since(upstreamStart), err,
+		)
+		p.logRequest(chatReq, modelName, "messages", start, 500, nil, true, err.Error(), nil, requestLogger)
+		http.Error(w, "Proxy error: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+	requestLogger.Info(
+		"Upstream call success: call_id=%s endpoint=messages status=%d elapsed=%v",
+		upstreamCallID, resp.StatusCode, time.Since(upstreamStart),
+	)
+	if p.shouldLogUpstreamHTTP() {
+		p.logHTTPUpstreamResponseStreamMeta(requestLogger, upstreamCallID, resp)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		respBody, _ := io.ReadAll(resp.Body)
+		if p.shouldLogUpstreamHTTP() {
+			p.logHTTPUpstreamResponseFull(requestLogger, upstreamCallID, resp, respBody)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(resp.StatusCode)
+		w.Write(respBody)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.WriteHeader(resp.StatusCode)
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "Streaming unsupported", http.StatusInternalServerError)
+		return
+	}
+
+	messageID := "msg_" + nextUniqueID()
+	stopReason := "end_turn"
+	inputTokens := 0
+	outputTokens := 0
+	aggregatedText := strings.Builder{}
+
+	writeEvent := func(eventName string, payload map[string]interface{}) {
+		data, _ := json.Marshal(payload)
+		fmt.Fprintf(w, "event: %s\n", eventName)
+		fmt.Fprintf(w, "data: %s\n\n", string(data))
+		flusher.Flush()
+	}
+
+	writeEvent("message_start", map[string]interface{}{
+		"type": "message_start",
+		"message": map[string]interface{}{
+			"id":            messageID,
+			"type":          "message",
+			"role":          "assistant",
+			"model":         modelName,
+			"content":       []interface{}{},
+			"stop_reason":   nil,
+			"stop_sequence": nil,
+			"usage": map[string]interface{}{
+				"input_tokens":  inputTokens,
+				"output_tokens": outputTokens,
+			},
+		},
+	})
+
+	writeEvent("content_block_start", map[string]interface{}{
+		"type":  "content_block_start",
+		"index": 0,
+		"content_block": map[string]interface{}{
+			"type": "text",
+			"text": "",
+		},
+	})
+
+	scanner := bufio.NewScanner(resp.Body)
+	// Increase scanner buffer for larger SSE lines.
+	buf := make([]byte, 0, 64*1024)
+	scanner.Buffer(buf, 2*1024*1024)
+
+	for scanner.Scan() {
+		select {
+		case <-r.Context().Done():
+			requestLogger.Warn("Client disconnected during /v1/messages SSE; stop streaming: %v", r.Context().Err())
+			return
+		default:
+		}
+
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "event:") {
+			continue
+		}
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+
+		dataPart := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if dataPart == "[DONE]" {
+			break
+		}
+
+		chunkBytes := p.normalizeStreamChunk([]byte(dataPart))
+		var chunk map[string]interface{}
+		if err := json.Unmarshal(chunkBytes, &chunk); err != nil {
+			continue
+		}
+
+		if id, ok := chunk["id"].(string); ok && id != "" {
+			messageID = id
+		}
+
+		if usageRaw, exists := chunk["usage"]; exists {
+			if usageMap, ok := usageRaw.(map[string]interface{}); ok {
+				if v, ok := asInt(usageMap["input_tokens"]); ok {
+					inputTokens = v
+				}
+				if v, ok := asInt(usageMap["output_tokens"]); ok {
+					outputTokens = v
+				}
+			}
+		}
+
+		if choicesRaw, exists := chunk["choices"]; exists {
+			if choices, ok := choicesRaw.([]interface{}); ok && len(choices) > 0 {
+				if choice, ok := choices[0].(map[string]interface{}); ok {
+					if finish, ok := choice["finish_reason"].(string); ok && finish != "" {
+						switch finish {
+						case "length":
+							stopReason = "max_tokens"
+						case "stop":
+							stopReason = "end_turn"
+						default:
+							stopReason = "end_turn"
+						}
+					}
+
+					if deltaRaw, exists := choice["delta"]; exists {
+						if delta, ok := deltaRaw.(map[string]interface{}); ok {
+							if text, ok := delta["content"].(string); ok && text != "" {
+								aggregatedText.WriteString(text)
+								writeEvent("content_block_delta", map[string]interface{}{
+									"type":  "content_block_delta",
+									"index": 0,
+									"delta": map[string]interface{}{
+										"type": "text_delta",
+										"text": text,
+									},
+								})
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		p.logRequest(chatReq, modelName, "messages", start, 502, nil, true, err.Error(), nil, requestLogger)
+		return
+	}
+
+	writeEvent("content_block_stop", map[string]interface{}{
+		"type":  "content_block_stop",
+		"index": 0,
+	})
+
+	writeEvent("message_delta", map[string]interface{}{
+		"type": "message_delta",
+		"delta": map[string]interface{}{
+			"stop_reason":   stopReason,
+			"stop_sequence": nil,
+		},
+		"usage": map[string]interface{}{
+			"output_tokens": outputTokens,
+		},
+	})
+
+	writeEvent("message_stop", map[string]interface{}{
+		"type": "message_stop",
+	})
+
+	usage := map[string]int{
+		"prompt_tokens":     inputTokens,
+		"completion_tokens": outputTokens,
+		"total_tokens":      inputTokens + outputTokens,
+	}
+
+	respForLog := map[string]interface{}{
+		"id":          messageID,
+		"type":        "message",
+		"role":        "assistant",
+		"model":       modelName,
+		"text":        aggregatedText.String(),
+		"stop_reason": stopReason,
+		"usage": map[string]interface{}{
+			"input_tokens":  inputTokens,
+			"output_tokens": outputTokens,
+		},
+	}
+	respBytes, _ := json.Marshal(respForLog)
+	p.logRequest(chatReq, modelName, "messages", start, resp.StatusCode, respBytes, true, "", usage, requestLogger)
+}
+
 // handleStreaming manages streaming responses
-func (p *Proxy) handleStreaming(w http.ResponseWriter, r *http.Request, proxyReq *http.Request, client *http.Client, reqBody map[string]interface{}, modelName string, start time.Time, endpoint string, requestLogger *logger.Logger) {
+func (p *Proxy) handleStreaming(w http.ResponseWriter, r *http.Request, proxyReq *http.Request, client *http.Client, reqBody map[string]interface{}, modelName string, start time.Time, endpoint string, requestLogger *logger.Logger, upstreamCallID string, upstreamStart time.Time, _ []byte) {
 	requestLogger.Info("=== Streaming mode initiated ===")
 
 	resp, err := client.Do(proxyReq)
 	if err != nil {
-		requestLogger.Error("Streaming request failed: %v", err)
+		if r.Context().Err() != nil {
+			requestLogger.Warn(
+				"Upstream call canceled: call_id=%s endpoint=%s reason=client_disconnected elapsed=%v err=%v",
+				upstreamCallID, endpoint, time.Since(upstreamStart), r.Context().Err(),
+			)
+		} else {
+			requestLogger.Error("Streaming request failed: %v", err)
+		}
 		p.logRequest(reqBody, modelName, endpoint, start, 500, nil, true, err.Error(), nil, requestLogger)
 		http.Error(w, "Proxy error: "+err.Error(), http.StatusBadGateway)
 		return
+	}
+	requestLogger.Info(
+		"Upstream call success: call_id=%s endpoint=%s status=%d elapsed=%v",
+		upstreamCallID, endpoint, resp.StatusCode, time.Since(upstreamStart),
+	)
+	if p.shouldLogUpstreamHTTP() {
+		p.logHTTPUpstreamResponseStreamMeta(requestLogger, upstreamCallID, resp)
 	}
 	defer resp.Body.Close()
 
@@ -298,12 +847,12 @@ func (p *Proxy) handleStreaming(w http.ResponseWriter, r *http.Request, proxyReq
 	// Create request log entry
 	sessionID := r.Header.Get("X-Session-ID")
 	if sessionID == "" {
-		sessionID = fmt.Sprintf("session_%d", time.Now().UnixNano())
+		sessionID = "session_" + nextUniqueID()
 	}
 	requestLogger.Info("Session ID: %s", sessionID)
 
 	reqLog := &storage.RequestLog{
-		ID:          fmt.Sprintf("req_%d", time.Now().UnixNano()),
+		ID:          "req_" + nextUniqueID(),
 		Timestamp:   time.Now(),
 		SessionID:   sessionID,
 		Endpoint:    endpoint,
@@ -320,6 +869,17 @@ func (p *Proxy) handleStreaming(w http.ResponseWriter, r *http.Request, proxyReq
 
 	scanner := make([]byte, 8192)
 	for {
+		select {
+		case <-r.Context().Done():
+			requestLogger.Warn("Client disconnected during streaming; stop reading upstream: %v", r.Context().Err())
+			reqLog.Error = "client disconnected"
+			reqLog.StatusCode = 499
+			reqLog.Duration = time.Since(start).String()
+			p.logger.SaveRequest(reqLog)
+			return
+		default:
+		}
+
 		n, err := resp.Body.Read(scanner)
 		if n > 0 {
 			chunkData := scanner[:n]
@@ -442,7 +1002,7 @@ func (p *Proxy) logRequest(reqBody map[string]interface{}, modelName, endpoint s
 	}
 
 	reqLog := &storage.RequestLog{
-		ID:          fmt.Sprintf("req_%d", time.Now().UnixNano()),
+		ID:          "req_" + nextUniqueID(),
 		Timestamp:   time.Now(),
 		SessionID:   sessionID,
 		Endpoint:    endpoint,
@@ -693,9 +1253,9 @@ func (p *Proxy) handleModels(w http.ResponseWriter, r *http.Request) {
 	models := make([]map[string]interface{}, 0, len(p.config.Models))
 	for _, model := range p.config.Models {
 		models = append(models, map[string]interface{}{
-			"id":      model.Name,
-			"object":  "model",
-			"created": 1677649999,
+			"id":       model.Name,
+			"object":   "model",
+			"created":  1677649999,
 			"owned_by": model.Name,
 		})
 	}
@@ -750,13 +1310,13 @@ func (p *Proxy) createCORSMiddleware(next http.Handler) http.Handler {
 func (p *Proxy) create404Logger(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Wrap response writer to capture status code without writing to original
-		wrapped := &noWriteStatusCapturingWriter{ResponseWriter: w, statusCode: http.StatusOK, wrote: false}
+		wrapped := &noWriteStatusCapturingWriter{ResponseWriter: w, statusCode: http.StatusOK}
 
 		next.ServeHTTP(wrapped, r)
 
 		// If 404, log the unregistered endpoint and send custom JSON response
-		if wrapped.statusCode == http.StatusNotFound && !wrapped.wrote {
-			requestID := fmt.Sprintf("unknown_%d", time.Now().UnixNano())
+		if wrapped.statusCode == http.StatusNotFound {
+			requestID := "unknown_" + nextUniqueID()
 			if p.appLogger != nil {
 				logger := p.appLogger.WithRequestID(requestID)
 				logger.Warn("UNREGISTERED ENDPOINT: %s %s from %s",
@@ -775,6 +1335,7 @@ func (p *Proxy) create404Logger(next http.Handler) http.Handler {
 				},
 				"registered_endpoints": []string{
 					"/v1/chat/completions",
+					"/v1/messages",
 					"/v1/completions",
 					"/v1/embeddings",
 					"/v1/models",
@@ -789,13 +1350,11 @@ func (p *Proxy) create404Logger(next http.Handler) http.Handler {
 type noWriteStatusCapturingWriter struct {
 	http.ResponseWriter
 	statusCode int
-	wrote      bool
 }
 
 func (w *noWriteStatusCapturingWriter) WriteHeader(code int) {
 	if code == http.StatusNotFound {
 		w.statusCode = code
-		w.wrote = true
 		return // Don't write 404 to original - we'll handle it
 	}
 	w.statusCode = code
@@ -803,10 +1362,70 @@ func (w *noWriteStatusCapturingWriter) WriteHeader(code int) {
 }
 
 func (w *noWriteStatusCapturingWriter) Write(b []byte) (int, error) {
-	if w.wrote {
+	if w.statusCode == http.StatusNotFound {
 		return len(b), nil // Suppress writing - we'll provide our own response
 	}
 	return w.ResponseWriter.Write(b)
+}
+
+// extractAnthropicTextContent reads Anthropic content blocks and returns merged text.
+func extractAnthropicTextContent(content interface{}) string {
+	switch c := content.(type) {
+	case string:
+		return c
+	case []interface{}:
+		parts := make([]string, 0, len(c))
+		for _, item := range c {
+			block, ok := item.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			blockType, _ := block["type"].(string)
+			if blockType != "text" && blockType != "" {
+				continue
+			}
+			if text, ok := block["text"].(string); ok && strings.TrimSpace(text) != "" {
+				parts = append(parts, text)
+			}
+		}
+		return strings.Join(parts, "\n")
+	default:
+		return ""
+	}
+}
+
+func asInt(v interface{}) (int, bool) {
+	switch t := v.(type) {
+	case int:
+		return t, true
+	case int64:
+		return int(t), true
+	case float64:
+		return int(t), true
+	case json.Number:
+		i, err := t.Int64()
+		if err != nil {
+			return 0, false
+		}
+		return int(i), true
+	default:
+		return 0, false
+	}
+}
+
+// getHTTPClient returns a non-nil client for the given model name.
+// Falls back to the first configured model client, and finally to a new default http.Client.
+func (p *Proxy) getHTTPClient(modelName string) *http.Client {
+	if c, exists := p.clients[modelName]; exists && c != nil {
+		return c
+	}
+	if len(p.config.Models) > 0 {
+		firstName := p.config.Models[0].Name
+		if c, exists := p.clients[firstName]; exists && c != nil {
+			return c
+		}
+	}
+	return &http.Client{Timeout: 300 * time.Second}
 }
 
 func (w *noWriteStatusCapturingWriter) Flush() {

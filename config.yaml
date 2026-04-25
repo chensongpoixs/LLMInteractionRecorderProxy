@@ -14,11 +14,18 @@ server:
 #     model: "Qwen3.6-35B-A3B-Claude-4.6-Opus-Reasoning-Distilled.Q8_0"
 #     timeout: 120s
 #     max_retries: 3
+# models:
+#   - name: "qwen3.6"
+#     base_url: "http://js1.blockelite.cn:57700/v1"
+#     api_key: "sk-not-required"  # llama.cpp 默认不需要 API Key
+#     model: "qwen3.6-35b-a3b-claude-4.6-opus-reasoning-distilled.q8_0"
+#     timeout: 300s
+#     max_retries: 3
 models:
-  - name: "qwen3.6"
-    base_url: "http://js1.blockelite.cn:57700/v1"
+  - name: "gemma3-4b"
+    base_url: "http://127.0.0.1:11434/v1"
     api_key: "sk-not-required"  # llama.cpp 默认不需要 API Key
-    model: "qwen3.6-35b-a3b-claude-4.6-opus-reasoning-distilled.q8_0"
+    model: "gemma-4-26B-A4B-it-Q4_K_M"
     timeout: 300s
     max_retries: 3
   # - name: "claude"
@@ -66,3 +73,15 @@ logging:
   request_log: true
   request_body_log: true
   response_body_log: true
+  # 为 true 时：在 INFO 打印 客户端->代理、代理->LLM 的完整 HTTP 及非流式时 LLM 的完整返回体（流式只打响应行+头，体为分块转发）
+  upstream_http_log: true
+  upstream_log_max_bytes: 262144
+
+# 每日合并前一日请求日志为单文件 JSONL（id/problem/thinking/solution/...）
+daily_export:
+  enable: true
+  output_dir: "./exports"
+  file_prefix: "Opus-4.6-Reasoning-3000x-filtered-"
+  run_hour: 0
+  run_minute: 5
+  timezone: "Local"

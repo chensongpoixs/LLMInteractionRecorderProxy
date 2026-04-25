@@ -143,7 +143,9 @@ func (l *Logger) log(level Level, msg string, args ...interface{}) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	if level > l.level {
+	// Keep logs at or above configured threshold.
+	// DEBUG(0) should include everything; ERROR(3) should include ERROR/FATAL only.
+	if level < l.level {
 		return
 	}
 
