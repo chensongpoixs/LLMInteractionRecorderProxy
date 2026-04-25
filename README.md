@@ -125,11 +125,32 @@ go build -o proxy-llm.exe .\cmd\server
 | `/v1/completions` | POST | 文本补全转发 |
 | `/v1/embeddings` | POST | 嵌入转发 |
 | `/v1/models` | GET | 返回已配置模型列表 |
+| `/api/usage/summary` | GET | Token 用量聚合统计（支持 `?days=7/30/90`） |
+| `/usage` | GET | Vue 前端 Usage Dashboard（近似 Cursor Usage 结构） |
 | `/v1/api/chat` | POST | 与 chat completions 同类处理（兼容 llama.cpp server） |
 | `/health` | GET | 健康检查（可在配置中关闭） |
 | `/metrics` | GET | Prometheus 指标（路径可由 `metrics_path` 修改） |
 
 未注册的其它路径会由中间件记录告警日志并返回 **404** JSON（内含当前已注册端点列表），不会自动透传到上游。
+
+## Usage Dashboard（Vue）
+
+服务启动后，直接访问：
+
+- `http://127.0.0.1:20901/usage`（端口按你的 `config.yaml` 为准）
+
+页面会调用后端接口：
+
+- `GET /api/usage/summary?days=30`
+
+返回字段包含：
+
+- 总览：`total_requests`、`success_rate`、`prompt_tokens`、`completion_tokens`、`total_tokens`、`estimated_cost_usd`、`avg_latency_ms`
+- 趋势：`daily[]`
+- 模型分布：`by_model[]`
+- 最近请求：`recent[]`（默认 20 条）
+
+说明：`estimated_cost_usd` 使用行业常见「每百万 token 单价」进行粗略估算，主要用于趋势对比，不等同于真实账单。
 
 ### 快速自测（请替换端口与 `model` 为配置中的 `name`）
 

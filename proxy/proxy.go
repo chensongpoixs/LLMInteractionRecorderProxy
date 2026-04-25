@@ -80,6 +80,9 @@ func New(cfg *config.Config, storageLogger *storage.Logger, metrics *Metrics, ap
 	mux.HandleFunc("/v1/api/chat", proxy.handleRequest("chat/completions"))
 	// Models endpoint - returns available models for Claude Code validation
 	mux.HandleFunc("/v1/models", proxy.handleModels)
+	// Usage dashboard endpoints
+	mux.HandleFunc("/usage", proxy.handleUsageDashboard)
+	mux.HandleFunc("/api/usage/summary", proxy.handler.HandleUsageSummary)
 
 	// Health check
 	if cfg.Monitoring.EnableHealth {
