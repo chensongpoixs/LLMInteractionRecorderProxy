@@ -2,25 +2,31 @@
 
 server:
   host: "0.0.0.0"
-  port: 8080
+  port: 20901
   tls_cert: ""  # Optional: path to TLS certificate
   tls_key: ""   # Optional: path to TLS key
 
 # LLM Models Configuration
+# models:
+#   - name: "QWen3.6"
+#     base_url: "http://js1.blockelite.cn:57700"
+#     api_key: "${OPENAI_API_KEY}"  # Can use environment variable
+#     model: "Qwen3.6-35B-A3B-Claude-4.6-Opus-Reasoning-Distilled.Q8_0"
+#     timeout: 120s
+#     max_retries: 3
 models:
-  - name: "gpt-4"
-    base_url: "https://api.openai.com/v1"
-    api_key: "${OPENAI_API_KEY}"  # Can use environment variable
-    model: "gpt-4-turbo"
-    timeout: 120s
+  - name: "qwen3.6"
+    base_url: "http://js1.blockelite.cn:57700/v1"
+    api_key: "sk-not-required"  # llama.cpp 默认不需要 API Key
+    model: "qwen3.6-35b-a3b-claude-4.6-opus-reasoning-distilled.q8_0"
+    timeout: 300s
     max_retries: 3
-
-  - name: "claude"
-    base_url: "https://api.anthropic.com/v1"
-    api_key: "${ANTHROPIC_API_KEY}"
-    model: "claude-3-opus-20240229"
-    timeout: 120s
-    max_retries: 3
+  # - name: "claude"
+  #   base_url: "https://api.anthropic.com/v1"
+  #   api_key: "${ANTHROPIC_API_KEY}"
+  #   model: "claude-3-opus-20240229"
+  #   timeout: 120s
+  #   max_retries: 3
 
 # Storage Configuration
 storage:
@@ -47,3 +53,16 @@ monitoring:
   enable_health: true
   enable_metrics: true
   metrics_path: "/metrics"
+
+# Logging Configuration
+logging:
+  level: "debug"           # debug, info, warn, error
+  file: "./logs/app.log"
+  max_size_mb: 100
+  max_backups: 10
+  max_age_days: 30
+  compress: true
+  console: true
+  request_log: true
+  request_body_log: true
+  response_body_log: true

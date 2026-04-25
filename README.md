@@ -14,6 +14,9 @@
 ### 1. 编译
 
 ```bash
+
+
+go mod download
 go build -o proxy-llm ./cmd/server
 ```
 

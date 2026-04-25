@@ -8,14 +8,16 @@ import (
 	"time"
 
 	"proxy-llm/config"
+	"proxy-llm/logger"
 	"proxy-llm/storage"
 )
 
 // Handler provides HTTP handlers for the proxy
 type Handler struct {
-	config  *config.Config
-	logger  *storage.Logger
-	metrics *Metrics
+	config    *config.Config
+	storageLogger *storage.Logger
+	metrics   *Metrics
+	appLogger *logger.Logger
 
 	requestCount   atomic.Int64
 	errorCount     atomic.Int64
@@ -23,16 +25,19 @@ type Handler struct {
 }
 
 // NewHandler creates a new handler instance
-func NewHandler(cfg *config.Config, logger *storage.Logger, metrics *Metrics) *Handler {
+func NewHandler(cfg *config.Config, storageLogger *storage.Logger, metrics *Metrics, appLogger *logger.Logger) *Handler {
+	appLogger.Info("Initializing HTTP handler...")
 	return &Handler{
-		config: cfg,
-		logger: logger,
-		metrics: metrics,
+		config:    cfg,
+		storageLogger: storageLogger,
+		metrics:   metrics,
+		appLogger: appLogger,
 	}
 }
 
 // HandleHealthCheck responds with server health status
 func (h *Handler) HandleHealthCheck(w http.ResponseWriter, r *http.Request) {
+	h.appLogger.Debug("Health check requested from: %s", r.RemoteAddr)
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(map[string]interface{}{
@@ -45,15 +50,18 @@ func (h *Handler) HandleHealthCheck(w http.ResponseWriter, r *http.Request) {
 
 // HandleListLogs lists available log files
 func (h *Handler) HandleListLogs(w http.ResponseWriter, r *http.Request) {
+	h.appLogger.Debug("Listing log files requested from: %s", r.RemoteAddr)
 	sessionID := r.URL.Query().Get("session")
 	date := r.URL.Query().Get("date")
 
-	files, err := h.logger.ListLogs(sessionID, date)
+	files, err := h.storageLogger.ListLogs(sessionID, date)
 	if err != nil {
+		h.appLogger.Error("Failed to list log files: %v", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
+	h.appLogger.Debug("Found %d log files", len(files))
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"files": files,
@@ -63,18 +71,22 @@ func (h *Handler) HandleListLogs(w http.ResponseWriter, r *http.Request) {
 
 // HandleGetLog retrieves a specific log file
 func (h *Handler) HandleGetLog(w http.ResponseWriter, r *http.Request) {
+	h.appLogger.Debug("Retrieving log file from: %s", r.RemoteAddr)
 	filePath := r.URL.Query().Get("file")
 	if filePath == "" {
+		h.appLogger.Warn("Log file retrieval missing 'file' parameter from: %s", r.RemoteAddr)
 		http.Error(w, "Missing 'file' parameter", http.StatusBadRequest)
 		return
 	}
 
-	entries, err := h.logger.ReadLog(filePath)
+	entries, err := h.storageLogger.ReadLog(filePath)
 	if err != nil {
+		h.appLogger.Error("Failed to read log file %s: %v", filePath, err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
+	h.appLogger.Debug("Read %d entries from %s", len(entries), filePath)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"file":    filePath,
@@ -134,6 +146,9 @@ func (h *Handler) RequestLogger(next http.HandlerFunc) http.HandlerFunc {
 
 		if wrapped.statusCode >= 400 {
 			h.IncrementErrorCount()
+			if h.appLogger != nil {
+				h.appLogger.Warn("Client error %d for %s %s", wrapped.statusCode, r.Method, r.URL.Path)
+			}
 		}
 	}
 }

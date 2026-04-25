@@ -10,12 +10,16 @@ import (
 
 // ModelConfig defines a single LLM provider configuration
 type ModelConfig struct {
-	Name        string        `yaml:"name"`
-	BaseURL     string        `yaml:"base_url"`
-	APIKey      string        `yaml:"api_key"`
-	ModelName   string        `yaml:"model"`
-	Timeout     time.Duration `yaml:"timeout"`
-	MaxRetries  int           `yaml:"max_retries"`
+	Name         string        `yaml:"name"`
+	BaseURL      string        `yaml:"base_url"`
+	APIKey       string        `yaml:"api_key"`
+	ModelName    string        `yaml:"model"`
+	Timeout      time.Duration `yaml:"timeout"`
+	MaxRetries   int           `yaml:"max_retries"`
+	// Llama.cpp specific configuration
+	LlamaAPI     string        `yaml:"llama_api"`      // llama.cpp API endpoint (e.g., "/v1/api/chat")
+	LlamaAPIKey  string        `yaml:"llama_api_key"`  // llama.cpp API key if required
+	LlamaModel   string        `yaml:"llama_model"`    // model name to send to llama.cpp
 }
 
 // StorageConfig defines how to store request/response data
@@ -35,6 +39,20 @@ type ServerConfig struct {
 	TLSKey   string `yaml:"tls_key"`
 }
 
+// LoggingConfig defines logging behavior
+type LoggingConfig struct {
+	Level          string `yaml:"level"`           // "debug", "info", "warn", "error"
+	File           string `yaml:"file"`
+	MaxSizeMB      int    `yaml:"max_size_mb"`
+	MaxBackups     int    `yaml:"max_backups"`
+	MaxAgeDays     int    `yaml:"max_age_days"`
+	Compress       bool   `yaml:"compress"`
+	Console        bool   `yaml:"console"`
+	RequestLog     bool   `yaml:"request_log"`
+	RequestBodyLog bool   `yaml:"request_body_log"`
+	ResponseBodyLog bool  `yaml:"response_body_log"`
+}
+
 // Config is the root configuration structure
 type Config struct {
 	Server     ServerConfig   `yaml:"server"`
@@ -42,6 +60,7 @@ type Config struct {
 	Storage    StorageConfig  `yaml:"storage"`
 	Proxy      ProxyConfig    `yaml:"proxy"`
 	Monitoring MonitoringConfig `yaml:"monitoring"`
+	Logging    LoggingConfig  `yaml:"logging"`
 }
 
 // ProxyConfig defines proxy behavior
@@ -127,6 +146,16 @@ func DefaultConfig() *Config {
 			EnableHealth:  true,
 			EnableMetrics: true,
 			MetricsPath:   "/metrics",
+		},
+		Logging: LoggingConfig{
+			Level:           "info",
+			File:            "./logs/app.log",
+			MaxSizeMB:       100,
+			MaxBackups:      10,
+			MaxAgeDays:      30,
+			Compress:        true,
+			Console:         true,
+			RequestLog:      true,
 		},
 	}
 }
