@@ -126,6 +126,7 @@ go build -o proxy-llm.exe .\cmd\server
 | `/v1/embeddings` | POST | 嵌入转发 |
 | `/v1/models` | GET | 返回已配置模型列表 |
 | `/api/usage/summary` | GET | Token 用量聚合统计（支持 `?days=7/30/90`） |
+| `/api/usage/stream` | GET | SSE：约每秒推送一次与 summary 同结构的 `usage` 事件（`?days=` 同上） |
 | `/usage` | GET | Vue 前端 Usage Dashboard（近似 Cursor Usage 结构） |
 | `/v1/api/chat` | POST | 与 chat completions 同类处理（兼容 llama.cpp server） |
 | `/health` | GET | 健康检查（可在配置中关闭） |
@@ -139,9 +140,10 @@ go build -o proxy-llm.exe .\cmd\server
 
 - `http://127.0.0.1:20901/usage`（端口按你的 `config.yaml` 为准）
 
-页面会调用后端接口：
+页面默认通过 **SSE**（`EventSource`）连接 `GET /api/usage/stream?days=...`，约每秒更新；也可在页面上切换回轮询模式。另可直接请求：
 
-- `GET /api/usage/summary?days=30`
+- `GET /api/usage/summary?days=30`（一次性 JSON）
+- `GET /api/usage/stream?days=30`（SSE，`event: usage`，data 为 JSON）
 
 返回字段包含：
 
