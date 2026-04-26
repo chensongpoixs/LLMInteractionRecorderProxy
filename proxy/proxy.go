@@ -84,6 +84,7 @@ func New(cfg *config.Config, storageLogger *storage.Logger, metrics *Metrics, ap
 	// Usage dashboard endpoints
 	mux.HandleFunc("/usage", proxy.handleUsageDashboard)
 	mux.HandleFunc("/api/usage/summary", proxy.handler.HandleUsageSummary)
+	mux.HandleFunc("/api/usage/stream", proxy.handler.HandleUsageStream)
 
 	// Health check
 	if cfg.Monitoring.EnableHealth {
@@ -635,6 +636,14 @@ func (p *Proxy) handleAnthropicMessagesStream(w http.ResponseWriter, r *http.Req
 	inputTokens := 0
 	outputTokens := 0
 	aggregatedText := strings.Builder{}
+	streamLines := 0
+	streamChunks := 0
+	streamParseErrors := 0
+	textDeltaCount := 0
+	toolCallDeltaCount := 0
+	inputJSONDeltaCount := 0
+	streamEndReason := "completed"
+	streamErr := ""
 	textBlockStarted := false
 	type streamedToolCall struct {
 		ID        string
@@ -643,6 +652,28 @@ func (p *Proxy) handleAnthropicMessagesStream(w http.ResponseWriter, r *http.Req
 	}
 	toolCalls := map[int]*streamedToolCall{}
 	toolCallOrder := make([]int, 0, 4)
+	defer func() {
+		requestLogger.Info(
+			"Messages stream summary: call_id=%s status=%d end_reason=%s stop_reason=%s elapsed=%v lines=%d chunks=%d parse_errors=%d text_deltas=%d tool_call_deltas=%d input_json_deltas=%d tool_uses=%d text_len=%d prompt_tokens=%d completion_tokens=%d total_tokens=%d err=%s",
+			upstreamCallID,
+			resp.StatusCode,
+			streamEndReason,
+			stopReason,
+			time.Since(start),
+			streamLines,
+			streamChunks,
+			streamParseErrors,
+			textDeltaCount,
+			toolCallDeltaCount,
+			inputJSONDeltaCount,
+			len(toolCallOrder),
+			aggregatedText.Len(),
+			inputTokens,
+			outputTokens,
+			inputTokens+outputTokens,
+			streamErr,
+		)
+	}()
 
 	writeEvent := func(eventName string, payload map[string]interface{}) {
 		data, _ := json.Marshal(payload)
@@ -674,9 +705,12 @@ func (p *Proxy) handleAnthropicMessagesStream(w http.ResponseWriter, r *http.Req
 	scanner.Buffer(buf, 2*1024*1024)
 
 	for scanner.Scan() {
+		streamLines++
 		select {
 		case <-r.Context().Done():
 			requestLogger.Warn("Client disconnected during /v1/messages SSE; stop streaming: %v", r.Context().Err())
+			streamEndReason = "client_disconnected"
+			streamErr = r.Context().Err().Error()
 			return
 		default:
 		}
@@ -691,14 +725,17 @@ func (p *Proxy) handleAnthropicMessagesStream(w http.ResponseWriter, r *http.Req
 
 		dataPart := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
 		if dataPart == "[DONE]" {
+			streamEndReason = "upstream_done"
 			break
 		}
 
 		chunkBytes := p.normalizeStreamChunk([]byte(dataPart))
 		var chunk map[string]interface{}
 		if err := json.Unmarshal(chunkBytes, &chunk); err != nil {
+			streamParseErrors++
 			continue
 		}
+		streamChunks++
 
 		if id, ok := chunk["id"].(string); ok && id != "" {
 			messageID = id
@@ -744,6 +781,7 @@ func (p *Proxy) handleAnthropicMessagesStream(w http.ResponseWriter, r *http.Req
 									textBlockStarted = true
 								}
 								aggregatedText.WriteString(text)
+								textDeltaCount++
 								writeEvent("content_block_delta", map[string]interface{}{
 									"type":  "content_block_delta",
 									"index": 0,
@@ -754,6 +792,7 @@ func (p *Proxy) handleAnthropicMessagesStream(w http.ResponseWriter, r *http.Req
 								})
 							}
 							if tcRaw, hasTC := delta["tool_calls"]; hasTC {
+								toolCallDeltaCount++
 								if tcArr, ok := tcRaw.([]interface{}); ok {
 									for i, t := range tcArr {
 										tcMap, ok := t.(map[string]interface{})
@@ -796,6 +835,8 @@ func (p *Proxy) handleAnthropicMessagesStream(w http.ResponseWriter, r *http.Req
 	}
 
 	if err := scanner.Err(); err != nil {
+		streamEndReason = "scanner_error"
+		streamErr = err.Error()
 		p.logRequest(chatReq, modelName, "messages", start, 502, nil, true, err.Error(), nil, requestLogger)
 		return
 	}
@@ -809,11 +850,16 @@ func (p *Proxy) handleAnthropicMessagesStream(w http.ResponseWriter, r *http.Req
 	if len(toolCallOrder) > 0 && stopReason != "max_tokens" {
 		stopReason = "tool_use"
 		sort.Ints(toolCallOrder)
+		baseIndex := 0
+		if textBlockStarted {
+			baseIndex = 1
+		}
 		for i, idx := range toolCallOrder {
 			tc := toolCalls[idx]
 			if tc == nil {
 				continue
 			}
+			blockIndex := baseIndex + i
 			toolID := tc.ID
 			if toolID == "" {
 				toolID = "toolu_" + nextUniqueID()
@@ -824,7 +870,7 @@ func (p *Proxy) handleAnthropicMessagesStream(w http.ResponseWriter, r *http.Req
 			}
 			writeEvent("content_block_start", map[string]interface{}{
 				"type":  "content_block_start",
-				"index": i + 1,
+				"index": blockIndex,
 				"content_block": map[string]interface{}{
 					"type":  "tool_use",
 					"id":    toolID,
@@ -834,9 +880,10 @@ func (p *Proxy) handleAnthropicMessagesStream(w http.ResponseWriter, r *http.Req
 			})
 			argStr := strings.TrimSpace(tc.Arguments.String())
 			if argStr != "" {
+				inputJSONDeltaCount++
 				writeEvent("content_block_delta", map[string]interface{}{
 					"type":  "content_block_delta",
-					"index": i + 1,
+					"index": blockIndex,
 					"delta": map[string]interface{}{
 						"type":         "input_json_delta",
 						"partial_json": argStr,
@@ -845,7 +892,7 @@ func (p *Proxy) handleAnthropicMessagesStream(w http.ResponseWriter, r *http.Req
 			}
 			writeEvent("content_block_stop", map[string]interface{}{
 				"type":  "content_block_stop",
-				"index": i + 1,
+				"index": blockIndex,
 			})
 		}
 	}

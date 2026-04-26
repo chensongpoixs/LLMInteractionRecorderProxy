@@ -206,18 +206,86 @@ func (h *Handler) RequestLogger(next http.HandlerFunc) http.HandlerFunc {
 
 // HandleUsageSummary returns aggregated token usage for dashboard UI.
 func (h *Handler) HandleUsageSummary(w http.ResponseWriter, r *http.Request) {
+	days := parseUsageDays(r)
+	resp, err := h.buildUsageSummary(days)
+	if err != nil {
+		h.appLogger.Error("Failed to build usage summary: %v", err)
+		http.Error(w, "Failed to read usage logs", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(resp)
+}
+
+// HandleUsageStream streams usage summary updates via SSE.
+func (h *Handler) HandleUsageStream(w http.ResponseWriter, r *http.Request) {
+	days := parseUsageDays(r)
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "Streaming unsupported", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.WriteHeader(http.StatusOK)
+
+	send := func() error {
+		resp, err := h.buildUsageSummary(days)
+		if err != nil {
+			return err
+		}
+		data, err := json.Marshal(resp)
+		if err != nil {
+			return err
+		}
+		_, err = fmt.Fprintf(w, "event: usage\ndata: %s\n\n", string(data))
+		if err != nil {
+			return err
+		}
+		flusher.Flush()
+		return nil
+	}
+
+	if err := send(); err != nil {
+		if h.appLogger != nil {
+			h.appLogger.Warn("usage SSE initial send failed: %v", err)
+		}
+		return
+	}
+
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case <-ticker.C:
+			if err := send(); err != nil {
+				if h.appLogger != nil {
+					h.appLogger.Warn("usage SSE send failed: %v", err)
+				}
+				return
+			}
+		}
+	}
+}
+
+func parseUsageDays(r *http.Request) int {
 	days := 30
 	if raw := strings.TrimSpace(r.URL.Query().Get("days")); raw != "" {
 		if n, err := strconv.Atoi(raw); err == nil && n > 0 && n <= 365 {
 			days = n
 		}
 	}
+	return days
+}
 
+func (h *Handler) buildUsageSummary(days int) (usageSummaryResponse, error) {
 	files, err := h.storageLogger.ListLogs("", "")
 	if err != nil {
-		h.appLogger.Error("Failed to list logs for usage summary: %v", err)
-		http.Error(w, "Failed to read usage logs", http.StatusInternalServerError)
-		return
+		return usageSummaryResponse{}, err
 	}
 
 	now := time.Now()
@@ -250,7 +318,9 @@ func (h *Handler) HandleUsageSummary(w http.ResponseWriter, r *http.Request) {
 
 	for _, file := range files {
 		path := filepath.ToSlash(file)
-		if strings.Contains(path, "/streams/") || strings.Contains(path, "_stream_") {
+		// Exclude raw chunk files under streams/ only.
+		// Keep *_stream_ request logs because they contain final token usage.
+		if strings.Contains(path, "/streams/") {
 			continue
 		}
 
@@ -382,8 +452,7 @@ func (h *Handler) HandleUsageSummary(w http.ResponseWriter, r *http.Request) {
 		Recent:           recent,
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(resp)
+	return resp, nil
 }
 
 func tokensFromRecord(rec storage.RequestLog) (int64, int64, int64) {

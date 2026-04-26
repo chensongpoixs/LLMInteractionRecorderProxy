@@ -118,11 +118,21 @@
       </div>
       <div class="toolbar">
         <span class="pill">周期</span>
-        <select v-model.number="days" @change="load">
+        <select v-model.number="days" @change="onDaysChange">
           <option :value="7">最近 7 天</option>
           <option :value="30">最近 30 天</option>
           <option :value="90">最近 90 天</option>
         </select>
+        <span class="pill">自动刷新 {{ autoRefresh ? "开" : "关" }}</span>
+        <span class="pill">推送 {{ streamMode ? "SSE" : "轮询" }}</span>
+        <button @click="toggleStreamMode">{{ streamMode ? "改为轮询" : "改为SSE" }}</button>
+        <select v-model.number="refreshSeconds" :disabled="!autoRefresh" @change="resetAutoRefresh">
+          <option :value="3">3s</option>
+          <option :value="5">5s</option>
+          <option :value="10">10s</option>
+          <option :value="30">30s</option>
+        </select>
+        <button @click="toggleAutoRefresh">{{ autoRefresh ? "暂停自动刷新" : "开启自动刷新" }}</button>
         <button @click="load">刷新</button>
       </div>
     </div>
@@ -224,6 +234,11 @@
       data() {
         return {
           days: 30,
+          streamMode: true,
+          autoRefresh: true,
+          refreshSeconds: 5,
+          refreshTimerId: null,
+          stream: null,
           summary: {
             total_tokens: 0,
             total_requests: 0,
@@ -255,11 +270,83 @@
           return Number(v || 0).toLocaleString("zh-CN");
         },
         async load() {
-          const res = await fetch(`/api/usage/summary?days=${this.days}`);
+          const res = await fetch(`/api/usage/summary?days=${this.days}&t=${Date.now()}`, {
+            cache: "no-store",
+          });
           if (!res.ok) {
             throw new Error("拉取 usage 数据失败");
           }
           this.summary = await res.json();
+        },
+        startAutoRefresh() {
+          if (this.streamMode) {
+            return;
+          }
+          this.stopAutoRefresh();
+          this.refreshTimerId = setInterval(() => {
+            this.load().catch((err) => {
+              console.error(err);
+            });
+          }, this.refreshSeconds * 1000);
+        },
+        stopAutoRefresh() {
+          if (this.refreshTimerId) {
+            clearInterval(this.refreshTimerId);
+            this.refreshTimerId = null;
+          }
+        },
+        toggleAutoRefresh() {
+          this.autoRefresh = !this.autoRefresh;
+          this.resetAutoRefresh();
+        },
+        startStream() {
+          this.stopStream();
+          const es = new EventSource(`/api/usage/stream?days=${this.days}`);
+          es.addEventListener("usage", (evt) => {
+            try {
+              this.summary = JSON.parse(evt.data);
+            } catch (err) {
+              console.error(err);
+            }
+          });
+          es.onerror = () => {
+            this.streamMode = false;
+            this.stopStream();
+            this.resetAutoRefresh();
+          };
+          this.stream = es;
+        },
+        stopStream() {
+          if (this.stream) {
+            this.stream.close();
+            this.stream = null;
+          }
+        },
+        toggleStreamMode() {
+          this.streamMode = !this.streamMode;
+          if (this.streamMode) {
+            this.stopAutoRefresh();
+            this.startStream();
+          } else {
+            this.stopStream();
+            this.resetAutoRefresh();
+          }
+        },
+        onDaysChange() {
+          this.load().catch((err) => console.error(err));
+          this.resetAutoRefresh();
+        },
+        resetAutoRefresh() {
+          if (this.streamMode) {
+            this.stopAutoRefresh();
+            this.startStream();
+            return;
+          }
+          if (this.autoRefresh) {
+            this.startAutoRefresh();
+          } else {
+            this.stopAutoRefresh();
+          }
         },
       },
       mounted() {
@@ -267,6 +354,15 @@
           console.error(err);
           alert("加载数据失败，请检查服务日志");
         });
+        if (this.streamMode) {
+          this.startStream();
+        } else {
+          this.startAutoRefresh();
+        }
+      },
+      beforeUnmount() {
+        this.stopAutoRefresh();
+        this.stopStream();
       },
     }).mount("#app");
   </script>
