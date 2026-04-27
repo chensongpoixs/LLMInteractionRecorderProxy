@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Usage Dashboard</title>
+  <title>Proxy LLM Dashboard</title>
   <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
   <style>
     :root {
@@ -38,10 +38,25 @@
     }
     .app { max-width: 1100px; margin: 0 auto; padding: 24px 20px 48px; }
 
+    /* Tabs */
+    .tabs {
+      display: flex; gap: 0; margin-bottom: 24px;
+      border-bottom: 1px solid var(--line);
+    }
+    .tab-btn {
+      padding: 10px 24px; font-size: 14px; font-weight: 500;
+      background: none; border: none; color: var(--text-secondary);
+      cursor: pointer; font-family: var(--font);
+      border-bottom: 2px solid transparent; margin-bottom: -1px;
+      transition: color .15s, border-color .15s;
+    }
+    .tab-btn:hover { color: var(--text); }
+    .tab-btn.active { color: var(--accent); border-bottom-color: var(--accent); }
+
     /* Header */
     .top-bar {
       display: flex; justify-content: space-between; align-items: center;
-      margin-bottom: 28px; flex-wrap: wrap; gap: 12px;
+      margin-bottom: 8px; flex-wrap: wrap; gap: 12px;
     }
     .logo-area { display: flex; align-items: center; gap: 12px; }
     .logo-icon {
@@ -171,6 +186,46 @@
       background: var(--accent-bg); color: var(--accent);
     }
 
+    /* Export tab */
+    .export-actions { display: flex; gap: 8px; align-items: center; margin-bottom: 16px; flex-wrap: wrap; }
+    .btn-primary {
+      background: var(--accent); color: #fff; border: none;
+      border-radius: 8px; padding: 8px 20px; font-size: 13px; font-weight: 500;
+      cursor: pointer; font-family: var(--font); transition: opacity .15s;
+    }
+    .btn-primary:hover { opacity: 0.85; }
+    .btn-primary:disabled { opacity: 0.4; cursor: not-allowed; }
+    .btn-sm {
+      background: var(--card); color: var(--accent); border: 1px solid var(--line);
+      border-radius: 6px; padding: 4px 14px; font-size: 12px;
+      cursor: pointer; font-family: var(--font); transition: all .15s;
+    }
+    .btn-sm:hover { background: var(--accent-bg); border-color: var(--accent); }
+    .btn-sm:disabled { opacity: 0.4; cursor: not-allowed; }
+    .btn-sm.download { color: var(--green); }
+    .btn-sm.download:hover { background: var(--green-bg); border-color: var(--green); }
+    .tag {
+      display: inline-block; font-size: 11px; padding: 2px 10px; border-radius: 999px;
+      font-weight: 500;
+    }
+    .tag.exported { background: var(--green-bg); color: var(--green); }
+    .tag.pending { background: var(--orange-bg); color: var(--orange); }
+    .tag.empty { background: rgba(255,255,255,0.05); color: var(--text-muted); }
+    .spin {
+      display: inline-block; width: 14px; height: 14px;
+      border: 2px solid var(--text-muted); border-top-color: var(--accent);
+      border-radius: 50%; animation: spin .6s linear infinite; vertical-align: middle;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .toast {
+      position: fixed; top: 20px; right: 20px; z-index: 999;
+      padding: 12px 20px; border-radius: 10px; font-size: 13px;
+      max-width: 400px; animation: fadeIn .2s;
+    }
+    .toast.success { background: #065f46; color: var(--green); border: 1px solid var(--green); }
+    .toast.error { background: #7f1d1d; color: var(--red); border: 1px solid var(--red); }
+    @keyframes fadeIn { from { opacity: 0; transform: translateY(-8px); } to { opacity: 1; transform: translateY(0); } }
+
     /* Responsive */
     @media (max-width: 880px) {
       .summary-grid { grid-template-columns: repeat(2, 1fr); }
@@ -199,11 +254,11 @@
       <div class="logo-area">
         <div class="logo-icon">P</div>
         <div>
-          <div class="logo-text">Usage</div>
-          <div class="logo-sub">LLM Proxy Dashboard</div>
+          <div class="logo-text">Proxy LLM</div>
+          <div class="logo-sub">Dashboard &amp; Data Export</div>
         </div>
       </div>
-      <div class="top-actions">
+      <div class="top-actions" v-if="activeTab === 'usage'">
         <span :class="'status-dot ' + (streamMode ? 'on' : 'off')"></span>
         <span style="font-size:12px;color:var(--text-secondary)">{{ streamMode ? 'Live' : 'Polling' }}</span>
         <select v-model.number="days" @change="onDaysChange">
@@ -214,169 +269,230 @@
         </select>
         <button @click="toggleStreamMode">{{ streamMode ? 'Polling' : 'Live' }}</button>
         <button @click="load" style="display:flex;align-items:center;gap:4px;">
-          <span v-if="loading" style="display:inline-block;width:12px;height:12px;border:2px solid var(--text-muted);border-top-color:var(--text);border-radius:50%;animation:spin .6s linear infinite;"></span>
+          <span v-if="loading" class="spin"></span>
           Refresh
         </button>
       </div>
     </div>
 
-    <!-- Loading skeleton -->
-    <template v-if="loading && !summary.total_requests">
-      <div class="summary-grid">
-        <div v-for="n in 4" class="summary-card shimmer" style="height:88px"></div>
-      </div>
-      <div class="card shimmer" style="height:300px;margin-bottom:16px"></div>
+    <!-- Tab Navigation -->
+    <div class="tabs">
+      <button :class="['tab-btn', { active: activeTab === 'usage' }]" @click="activeTab = 'usage'">用量统计</button>
+      <button :class="['tab-btn', { active: activeTab === 'export' }]" @click="activeTab = 'export'; loadExportDates()">数据导出</button>
+    </div>
+
+    <!-- ============ USAGE TAB ============ -->
+    <template v-if="activeTab === 'usage'">
+      <!-- Loading skeleton -->
+      <template v-if="loading && !summary.total_requests">
+        <div class="summary-grid">
+          <div v-for="n in 4" class="summary-card shimmer" style="height:88px"></div>
+        </div>
+        <div class="card shimmer" style="height:300px;margin-bottom:16px"></div>
+      </template>
+
+      <template v-else>
+        <!-- Summary Cards -->
+        <div class="summary-grid">
+          <div class="summary-card">
+            <div class="label">Total Cost</div>
+            <div class="value">${{ fmtCost(summary.estimated_cost_usd) }}</div>
+            <div class="sub">{{ fmtInt(summary.total_requests) }} requests</div>
+          </div>
+          <div class="summary-card">
+            <div class="label">Total Tokens</div>
+            <div class="value">{{ fmtInt(summary.total_tokens) }}</div>
+            <div class="sub">{{ fmtInt(summary.prompt_tokens) }} in &middot; {{ fmtInt(summary.completion_tokens) }} out</div>
+            <div class="ratio-bar" v-if="summary.total_tokens > 0">
+              <div class="in" :style="{flex: summary.prompt_tokens / summary.total_tokens}"></div>
+              <div class="out" :style="{flex: summary.completion_tokens / summary.total_tokens}"></div>
+            </div>
+            <div class="ratio-labels">
+              <span>Input {{ ratio(summary.prompt_tokens, summary.total_tokens) }}%</span>
+              <span>Output {{ ratio(summary.completion_tokens, summary.total_tokens) }}%</span>
+            </div>
+          </div>
+          <div class="summary-card">
+            <div class="label">Success Rate</div>
+            <div class="value">{{ (summary.success_rate * 100).toFixed(1) }}%</div>
+            <div class="sub">{{ fmtInt(summary.success_requests) }} / {{ fmtInt(summary.total_requests) }} succeeded</div>
+            <div class="ratio-bar" v-if="summary.total_requests > 0">
+              <div class="in" :style="{flex: summary.success_rate}"></div>
+              <div class="out" :style="{flex: 1 - summary.success_rate}"></div>
+            </div>
+          </div>
+          <div class="summary-card">
+            <div class="label">Avg Latency</div>
+            <div class="value">{{ fmtLatency(summary.avg_latency_ms) }}</div>
+            <div class="sub">Updated {{ timeAgo(summary.generated_at) }}</div>
+          </div>
+        </div>
+
+        <!-- Two Column: Chart + Models -->
+        <div class="two-col">
+          <div class="card">
+            <div class="card-title">
+              <span>Daily Token Usage</span>
+              <span class="badge">{{ chartData.length }} days</span>
+            </div>
+            <div class="chart-wrap">
+              <div class="chart-y-label">
+                <span>{{ fmtInt(chartMax) }}</span>
+                <span>{{ fmtInt(Math.round(chartMax/2)) }}</span>
+                <span>0</span>
+              </div>
+              <div class="chart-area">
+                <div class="col-wrap" v-for="point in chartData" :key="point.date">
+                  <div class="col-tooltip">
+                    <div style="font-weight:600;margin-bottom:4px;">{{ point.dateLabel }}</div>
+                    <div style="display:flex;gap:12px;">
+                      <span>Input {{ fmtInt(point.prompt_tokens) }}</span>
+                      <span>Output {{ fmtInt(point.completion_tokens) }}</span>
+                    </div>
+                  </div>
+                  <div class="col-stack" :style="{height: point.height + '%'}">
+                    <div class="o" :style="{flex: point.completion_ratio}"></div>
+                    <div class="i" :style="{flex: point.prompt_ratio}"></div>
+                  </div>
+                  <div class="col-label">{{ point.shortDate }}</div>
+                </div>
+                <div v-if="chartData.length === 0" class="empty-state">No data for this period</div>
+              </div>
+            </div>
+            <div style="display:flex;gap:16px;margin-top:12px;font-size:12px;color:var(--text-secondary);">
+              <span><span style="display:inline-block;width:10px;height:10px;border-radius:2px;background:var(--input-color);vertical-align:middle;margin-right:4px;"></span> Input</span>
+              <span><span style="display:inline-block;width:10px;height:10px;border-radius:2px;background:var(--output-color);vertical-align:middle;margin-right:4px;"></span> Output</span>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-title">
+              <span>Models</span>
+              <span class="badge">{{ summary.by_model.length }}</span>
+            </div>
+            <div class="model-list">
+              <template v-if="summary.by_model.length === 0">
+                <div class="empty-state">No model data</div>
+              </template>
+              <div class="model-row" v-for="m in summary.by_model" :key="m.model">
+                <div class="top">
+                  <span class="name">{{ shortModel(m.model) }}</span>
+                  <span class="tokens">{{ fmtInt(m.total_tokens) }} tokens</span>
+                </div>
+                <div class="model-bar-wrap">
+                  <div class="i" :style="{flex: m.prompt_tokens / Math.max(m.total_tokens, 1)}"></div>
+                  <div class="o" :style="{flex: m.completion_tokens / Math.max(m.total_tokens, 1)}"></div>
+                </div>
+                <div class="cost-row">
+                  <span>{{ fmtInt(m.requests) }} req &middot; {{ fmtInt(m.prompt_tokens) }} in / {{ fmtInt(m.completion_tokens) }} out</span>
+                  <span>${{ fmtCost(m.estimated_cost_usd) }}</span>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Recent Requests -->
+        <div class="card">
+          <div class="card-title">
+            <span>Recent Requests</span>
+            <span class="badge">Top {{ Math.min(summary.recent.length, 20) }}</span>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Time</th><th>Model</th><th>Endpoint</th><th>Status</th>
+                  <th style="text-align:right">Input</th><th style="text-align:right">Output</th>
+                  <th style="text-align:right">Total</th><th style="text-align:right">Latency</th><th style="text-align:right">Cost</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="r in summary.recent" :key="r.timestamp + r.model + r.endpoint">
+                  <td style="color:var(--text-secondary);font-size:12px;">{{ fmtTime(r.timestamp) }}</td>
+                  <td><span class="model-tag">{{ shortModel(r.model) }}</span></td>
+                  <td>{{ shortEndpoint(r.endpoint) }}</td>
+                  <td>
+                    <span class="status-code">
+                      <span :class="r.status_code < 400 ? 'dot-ok' : 'dot-err'"></span>{{ r.status_code }}
+                    </span>
+                  </td>
+                  <td style="text-align:right">{{ fmtInt(r.prompt_tokens) }}</td>
+                  <td style="text-align:right">{{ fmtInt(r.completion_tokens) }}</td>
+                  <td style="text-align:right;font-weight:500;">{{ fmtInt(r.total_tokens) }}</td>
+                  <td style="text-align:right;color:var(--text-secondary)">{{ fmtLatency(r.duration_ms) }}</td>
+                  <td style="text-align:right;color:var(--text-secondary)">${{ r.estimated_cost_usd.toFixed(4) }}</td>
+                </tr>
+                <tr v-if="summary.recent.length === 0">
+                  <td colspan="9" class="empty-state">No recent requests</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </template>
     </template>
 
-    <template v-else>
-      <!-- Summary Cards -->
-      <div class="summary-grid">
-        <div class="summary-card">
-          <div class="label">💰 Total Cost</div>
-          <div class="value">${{ fmtCost(summary.estimated_cost_usd) }}</div>
-          <div class="sub">{{ fmtInt(summary.total_requests) }} requests</div>
-        </div>
-        <div class="summary-card">
-          <div class="label">📊 Total Tokens</div>
-          <div class="value">{{ fmtInt(summary.total_tokens) }}</div>
-          <div class="sub">
-            {{ fmtInt(summary.prompt_tokens) }} in · {{ fmtInt(summary.completion_tokens) }} out
-          </div>
-          <div class="ratio-bar" v-if="summary.total_tokens > 0">
-            <div class="in" :style="{flex: summary.prompt_tokens / summary.total_tokens}"></div>
-            <div class="out" :style="{flex: summary.completion_tokens / summary.total_tokens}"></div>
-          </div>
-          <div class="ratio-labels">
-            <span>Input {{ ratio(summary.prompt_tokens, summary.total_tokens) }}%</span>
-            <span>Output {{ ratio(summary.completion_tokens, summary.total_tokens) }}%</span>
-          </div>
-        </div>
-        <div class="summary-card">
-          <div class="label">✅ Success Rate</div>
-          <div class="value">{{ (summary.success_rate * 100).toFixed(1) }}%</div>
-          <div class="sub">{{ fmtInt(summary.success_requests) }} / {{ fmtInt(summary.total_requests) }} succeeded</div>
-          <div class="ratio-bar" v-if="summary.total_requests > 0">
-            <div class="in" :style="{flex: summary.success_rate}"></div>
-            <div class="out" :style="{flex: 1 - summary.success_rate}"></div>
-          </div>
-        </div>
-        <div class="summary-card">
-          <div class="label">⚡ Avg Latency</div>
-          <div class="value">{{ fmtLatency(summary.avg_latency_ms) }}</div>
-          <div class="sub">Updated {{ timeAgo(summary.generated_at) }}</div>
-        </div>
+    <!-- ============ EXPORT TAB ============ -->
+    <template v-if="activeTab === 'export'">
+      <div class="export-actions">
+        <span style="font-size:13px;color:var(--text-secondary);">选择日期后点击"导出"，可下载单日 JSONL 数据集</span>
+        <button class="btn-sm" @click="loadExportDates" style="margin-left:auto;">
+          <span v-if="exportLoading" class="spin" style="width:12px;height:12px;"></span>
+          刷新列表
+        </button>
       </div>
 
-      <!-- Two Column: Chart + Models -->
-      <div class="two-col">
-        <div class="card">
-          <div class="card-title">
-            <span>Daily Token Usage</span>
-            <span class="badge">{{ chartData.length }} days</span>
-          </div>
-          <div class="chart-wrap">
-            <div class="chart-y-label">
-              <span>{{ fmtInt(chartMax) }}</span>
-              <span>{{ fmtInt(Math.round(chartMax/2)) }}</span>
-              <span>0</span>
-            </div>
-            <div class="chart-area">
-              <div class="col-wrap" v-for="point in chartData" :key="point.date">
-                <div class="col-tooltip">
-                  <div style="font-weight:600;margin-bottom:4px;">{{ point.dateLabel }}</div>
-                  <div style="display:flex;gap:12px;">
-                    <span>Input {{ fmtInt(point.prompt_tokens) }}</span>
-                    <span>Output {{ fmtInt(point.completion_tokens) }}</span>
-                  </div>
-                </div>
-                <div class="col-stack" :style="{height: point.height + '%'}">
-                  <div class="o" :style="{flex: point.completion_ratio}"></div>
-                  <div class="i" :style="{flex: point.prompt_ratio}"></div>
-                </div>
-                <div class="col-label">{{ point.shortDate }}</div>
-              </div>
-              <div v-if="chartData.length === 0" class="empty-state">No data for this period</div>
-            </div>
-          </div>
-          <div style="display:flex;gap:16px;margin-top:12px;font-size:12px;color:var(--text-secondary);">
-            <span><span style="display:inline-block;width:10px;height:10px;border-radius:2px;background:var(--input-color);vertical-align:middle;margin-right:4px;"></span> Input</span>
-            <span><span style="display:inline-block;width:10px;height:10px;border-radius:2px;background:var(--output-color);vertical-align:middle;margin-right:4px;"></span> Output</span>
-          </div>
-        </div>
-
-        <div class="card">
-          <div class="card-title">
-            <span>Models</span>
-            <span class="badge">{{ summary.by_model.length }}</span>
-          </div>
-          <div class="model-list">
-            <template v-if="summary.by_model.length === 0">
-              <div class="empty-state">No model data</div>
-            </template>
-            <div class="model-row" v-for="m in summary.by_model" :key="m.model">
-              <div class="top">
-                <span class="name">{{ shortModel(m.model) }}</span>
-                <span class="tokens">{{ fmtInt(m.total_tokens) }} tokens</span>
-              </div>
-              <div class="model-bar-wrap">
-                <div class="i" :style="{flex: m.prompt_tokens / Math.max(m.total_tokens, 1)}"></div>
-                <div class="o" :style="{flex: m.completion_tokens / Math.max(m.total_tokens, 1)}"></div>
-              </div>
-              <div class="cost-row">
-                <span>{{ fmtInt(m.requests) }} req · {{ fmtInt(m.prompt_tokens) }} in / {{ fmtInt(m.completion_tokens) }} out</span>
-                <span>${{ fmtCost(m.estimated_cost_usd) }}</span>
-              </div>
-            </div>
-          </div>
-        </div>
-      </div>
-
-      <!-- Recent Requests -->
       <div class="card">
         <div class="card-title">
-          <span>Recent Requests</span>
-          <span class="badge">Top {{ Math.min(summary.recent.length, 20) }}</span>
+          <span>按天导出</span>
+          <span class="badge">{{ exportDates.length }} 天</span>
         </div>
         <div class="table-wrap">
           <table>
             <thead>
               <tr>
-                <th>Time</th>
-                <th>Model</th>
-                <th>Endpoint</th>
-                <th>Status</th>
-                <th style="text-align:right">Input</th>
-                <th style="text-align:right">Output</th>
-                <th style="text-align:right">Total</th>
-                <th style="text-align:right">Latency</th>
-                <th style="text-align:right">Cost</th>
+                <th style="width:120px">日期</th>
+                <th style="width:100px">日志文件数</th>
+                <th style="width:100px">状态</th>
+                <th style="width:280px">操作</th>
               </tr>
             </thead>
             <tbody>
-              <tr v-for="r in summary.recent" :key="r.timestamp + r.model + r.endpoint">
-                <td style="color:var(--text-secondary);font-size:12px;">{{ fmtTime(r.timestamp) }}</td>
-                <td><span class="model-tag">{{ shortModel(r.model) }}</span></td>
-                <td>{{ shortEndpoint(r.endpoint) }}</td>
-                <td>
-                  <span class="status-code">
-                    <span :class="r.status_code < 400 ? 'dot-ok' : 'dot-err'"></span>
-                    {{ r.status_code }}
-                  </span>
-                </td>
-                <td style="text-align:right">{{ fmtInt(r.prompt_tokens) }}</td>
-                <td style="text-align:right">{{ fmtInt(r.completion_tokens) }}</td>
-                <td style="text-align:right;font-weight:500;">{{ fmtInt(r.total_tokens) }}</td>
-                <td style="text-align:right;color:var(--text-secondary)">{{ fmtLatency(r.duration_ms) }}</td>
-                <td style="text-align:right;color:var(--text-secondary)">${{ r.estimated_cost_usd.toFixed(4) }}</td>
+              <tr v-if="exportDates.length === 0 && !exportLoading">
+                <td colspan="4" class="empty-state">暂无数据 — 请先通过代理发送请求产生日志</td>
               </tr>
-              <tr v-if="summary.recent.length === 0">
-                <td colspan="9" class="empty-state">No recent requests</td>
+              <tr v-for="d in exportDates" :key="d.date">
+                <td style="font-weight:500;">{{ fmtExportDate(d.date) }}</td>
+                <td>{{ d.file_count }} 个文件</td>
+                <td>
+                  <span v-if="d.exported" class="tag exported">已导出</span>
+                  <span v-else-if="d.file_count > 0" class="tag pending">待导出</span>
+                  <span v-else class="tag empty">无数据</span>
+                </td>
+                <td>
+                  <div style="display:flex;gap:6px;align-items:center;">
+                    <button class="btn-sm"
+                      :disabled="d.file_count === 0 || d.exporting"
+                      @click="triggerExport(d)">
+                      <span v-if="d.exporting" class="spin" style="width:12px;height:12px;"></span>
+                      {{ d.exporting ? '导出中...' : '导出' }}
+                    </button>
+                    <button v-if="d.exported && d.export_file" class="btn-sm download"
+                      @click="downloadExport(d.export_file)">
+                      下载
+                    </button>
+                  </div>
+                </td>
               </tr>
             </tbody>
           </table>
         </div>
       </div>
     </template>
+
+    <!-- Toast -->
+    <div v-if="toast.show" :class="['toast', toast.type]">{{ toast.message }}</div>
   </div>
 
   <script>
@@ -385,27 +501,18 @@
     createApp({
       data() {
         return {
-          days: 30,
-          streamMode: true,
-          autoRefresh: true,
-          refreshSeconds: 5,
-          refreshTimerId: null,
-          stream: null,
-          loading: false,
+          activeTab: 'usage',
+          // Usage tab state
+          days: 30, streamMode: true, autoRefresh: true, refreshSeconds: 5,
+          refreshTimerId: null, stream: null, loading: false,
           summary: {
-            total_tokens: 0,
-            total_requests: 0,
-            success_requests: 0,
-            success_rate: 0,
-            estimated_cost_usd: 0,
-            prompt_tokens: 0,
-            completion_tokens: 0,
-            avg_latency_ms: 0,
-            generated_at: "",
-            daily: [],
-            by_model: [],
-            recent: [],
+            total_tokens: 0, total_requests: 0, success_requests: 0, success_rate: 0,
+            estimated_cost_usd: 0, prompt_tokens: 0, completion_tokens: 0,
+            avg_latency_ms: 0, generated_at: "", daily: [], by_model: [], recent: [],
           },
+          // Export tab state
+          exportDates: [], exportLoading: false,
+          toast: { show: false, message: '', type: 'success' },
         };
       },
       computed: {
@@ -414,118 +521,97 @@
           const max = daily.reduce((m, p) => Math.max(m, p.total_tokens || 0, 1), 1);
           return daily.map((p) => {
             const total = p.total_tokens || 1;
-            const inR = p.prompt_tokens / total;
-            const outR = p.completion_tokens / total;
             return {
-              ...p,
-              height: Math.max(2, (p.total_tokens / max) * 100),
-              prompt_ratio: inR,
-              completion_ratio: outR,
-              shortDate: (p.date || "").slice(5),
-              dateLabel: p.date || "",
+              ...p, height: Math.max(2, (p.total_tokens / max) * 100),
+              prompt_ratio: p.prompt_tokens / total, completion_ratio: p.completion_tokens / total,
+              shortDate: (p.date || "").slice(5), dateLabel: p.date || "",
             };
           });
         },
         chartMax() {
-          const daily = this.summary.daily || [];
-          return daily.reduce((m, p) => Math.max(m, p.total_tokens || 0), 0) || 1;
+          return (this.summary.daily || []).reduce((m, p) => Math.max(m, p.total_tokens || 0), 0) || 1;
         },
       },
       methods: {
         Math: window.Math,
-        fmtInt(v) {
-          return Number(v || 0).toLocaleString("zh-CN");
-        },
-        fmtCost(v) {
-          const n = Number(v || 0);
-          if (n < 0.01) return n.toFixed(4);
-          if (n < 1) return n.toFixed(3);
-          return n.toFixed(2);
-        },
-        fmtLatency(ms) {
-          const n = Number(ms || 0);
-          if (n < 1000) return n + 'ms';
-          return (n / 1000).toFixed(1) + 's';
-        },
+        fmtInt(v) { return Number(v || 0).toLocaleString("zh-CN"); },
+        fmtCost(v) { const n = Number(v || 0); if (n < 0.01) return n.toFixed(4); if (n < 1) return n.toFixed(3); return n.toFixed(2); },
+        fmtLatency(ms) { const n = Number(ms || 0); return n < 1000 ? n + 'ms' : (n / 1000).toFixed(1) + 's'; },
         fmtTime(ts) {
           if (!ts) return '-';
-          const d = new Date(ts);
-          const pad = (n) => String(n).padStart(2, '0');
+          const d = new Date(ts), pad = (n) => String(n).padStart(2, '0');
           return pad(d.getMonth()+1) + '/' + pad(d.getDate()) + ' ' + pad(d.getHours()) + ':' + pad(d.getMinutes());
         },
         timeAgo(ts) {
           if (!ts) return '-';
-          const diff = Date.now() - new Date(ts).getTime();
-          const sec = Math.floor(diff / 1000);
-          if (sec < 60) return sec + 's ago';
-          if (sec < 3600) return Math.floor(sec/60) + 'm ago';
-          if (sec < 86400) return Math.floor(sec/3600) + 'h ago';
-          return Math.floor(sec/86400) + 'd ago';
+          const diff = Date.now() - new Date(ts).getTime(), sec = Math.floor(diff / 1000);
+          if (sec < 60) return sec + 's ago'; if (sec < 3600) return Math.floor(sec/60) + 'm ago';
+          if (sec < 86400) return Math.floor(sec/3600) + 'h ago'; return Math.floor(sec/86400) + 'd ago';
         },
-        shortModel(m) {
-          if (!m) return 'unknown';
-          return m.replace(/^claude-/, 'claude.').replace(/^gpt-/, 'gpt.');
-        },
-        shortEndpoint(e) {
-          if (!e) return '-';
-          const parts = e.split('/');
-          return parts[parts.length-1] || e;
-        },
-        ratio(a, b) {
-          if (!b) return 0;
-          return Math.round((a / b) * 100);
-        },
+        shortModel(m) { if (!m) return 'unknown'; return m.replace(/^claude-/, 'claude.').replace(/^gpt-/, 'gpt.'); },
+        shortEndpoint(e) { if (!e) return '-'; const parts = e.split('/'); return parts[parts.length-1] || e; },
+        ratio(a, b) { if (!b) return 0; return Math.round((a / b) * 100); },
+        fmtExportDate(d) { if (!d || d.length !== 8) return d; return d.slice(0,4) + '-' + d.slice(4,6) + '-' + d.slice(6,8); },
+
+        // === Usage tab ===
         async load() {
           this.loading = true;
           try {
-            const res = await fetch(`/api/usage/summary?days=${this.days}&t=${Date.now()}`, {
-              cache: "no-store",
-            });
+            const res = await fetch(`/api/usage/summary?days=${this.days}&t=${Date.now()}`, { cache: "no-store" });
             if (!res.ok) throw new Error("Failed to fetch usage data");
-            const data = await res.json();
-            this.summary = data;
-          } catch (err) {
-            console.error(err);
-          } finally {
-            this.loading = false;
-          }
+            this.summary = await res.json();
+          } catch (err) { console.error(err); }
+          finally { this.loading = false; }
         },
-        startAutoRefresh() {
-          if (this.streamMode) return;
-          this.stopAutoRefresh();
-          this.refreshTimerId = setInterval(() => {
-            this.load().catch(console.error);
-          }, this.refreshSeconds * 1000);
-        },
-        stopAutoRefresh() {
-          if (this.refreshTimerId) {
-            clearInterval(this.refreshTimerId);
-            this.refreshTimerId = null;
-          }
-        },
+        startAutoRefresh() { if (this.streamMode) return; this.stopAutoRefresh(); this.refreshTimerId = setInterval(() => this.load().catch(console.error), this.refreshSeconds * 1000); },
+        stopAutoRefresh() { if (this.refreshTimerId) { clearInterval(this.refreshTimerId); this.refreshTimerId = null; } },
         startStream() {
           this.stopStream();
           const es = new EventSource(`/api/usage/stream?days=${this.days}`);
-          es.addEventListener("usage", (evt) => {
-            try { this.summary = JSON.parse(evt.data); } catch (err) { console.error(err); }
-          });
-          es.onerror = () => {
-            this.streamMode = false;
-            this.stopStream();
-          };
+          es.addEventListener("usage", (evt) => { try { this.summary = JSON.parse(evt.data); } catch (err) { console.error(err); } });
+          es.onerror = () => { this.streamMode = false; this.stopStream(); };
           this.stream = es;
         },
-        stopStream() {
-          if (this.stream) { this.stream.close(); this.stream = null; }
+        stopStream() { if (this.stream) { this.stream.close(); this.stream = null; } },
+        toggleStreamMode() { this.streamMode = !this.streamMode; if (this.streamMode) { this.stopAutoRefresh(); this.startStream(); } else { this.stopStream(); this.startAutoRefresh(); } },
+        onDaysChange() { this.load().catch(console.error); if (this.streamMode) { this.stopStream(); this.startStream(); } },
+
+        // === Export tab ===
+        showToast(msg, type) {
+          this.toast = { show: true, message: msg, type: type };
+          setTimeout(() => { this.toast.show = false; }, 3500);
         },
-        toggleStreamMode() {
-          this.streamMode = !this.streamMode;
-          if (this.streamMode) { this.stopAutoRefresh(); this.startStream(); }
-          else { this.stopStream(); this.startAutoRefresh(); }
+        async loadExportDates() {
+          this.exportLoading = true;
+          try {
+            const res = await fetch('/api/export/dates?t=' + Date.now(), { cache: "no-store" });
+            if (!res.ok) throw new Error("Failed to load dates");
+            const data = await res.json();
+            // Preserve exporting state on existing entries
+            const oldMap = {};
+            this.exportDates.forEach(d => { oldMap[d.date] = d.exporting; });
+            this.exportDates = (data.dates || []).map(d => ({ ...d, exporting: !!oldMap[d.date] }));
+          } catch (err) {
+            console.error(err);
+            this.showToast('加载日期列表失败: ' + err.message, 'error');
+          } finally { this.exportLoading = false; }
         },
-        onDaysChange() {
-          this.load().catch(console.error);
-          if (this.streamMode) { this.stopStream(); this.startStream(); }
+        async triggerExport(d) {
+          d.exporting = true;
+          try {
+            const res = await fetch('/api/export/day?date=' + d.date, { method: 'POST', cache: "no-store" });
+            const data = await res.json();
+            if (!res.ok) throw new Error(data.error || 'Export failed');
+            d.exported = true;
+            d.export_file = data.file;
+            this.showToast(d.date + ' 导出完成 — ' + this.fmtInt(data.rows) + ' 条记录', 'success');
+          } catch (err) {
+            console.error(err);
+            this.showToast(d.date + ' 导出失败: ' + err.message, 'error');
+          } finally { d.exporting = false; }
+        },
+        downloadExport(fileName) {
+          window.open('/api/export/download?file=' + encodeURIComponent(fileName), '_blank');
         },
       },
       mounted() {

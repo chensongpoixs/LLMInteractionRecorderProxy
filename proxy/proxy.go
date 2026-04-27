@@ -8,13 +8,16 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"sort"
-	"sync"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"proxy-llm/config"
+	"proxy-llm/exporter"
 	"proxy-llm/logger"
 	"proxy-llm/storage"
 )
@@ -41,6 +44,8 @@ type Proxy struct {
 
 	// conversationTracker maps sessionID -> full message chain for multi-turn context
 	conversations sync.Map
+
+	exportMu sync.Mutex // guards concurrent exports
 }
 
 // New creates a new proxy instance
@@ -67,7 +72,7 @@ func New(cfg *config.Config, storageLogger *storage.Logger, metrics *Metrics, ap
 
 		proxy.clients[model.Name] = &http.Client{
 			Transport: transport,
-			Timeout:   model.Timeout,
+				// No Client.Timeout — it kills long-running SSE streams.
 		}
 	}
 
@@ -89,6 +94,11 @@ func New(cfg *config.Config, storageLogger *storage.Logger, metrics *Metrics, ap
 	mux.HandleFunc("/usage", proxy.handleUsageDashboard)
 	mux.HandleFunc("/api/usage/summary", proxy.handler.HandleUsageSummary)
 	mux.HandleFunc("/api/usage/stream", proxy.handler.HandleUsageStream)
+
+	// Export endpoints
+	mux.HandleFunc("/api/export/dates", proxy.handleExportDates)
+	mux.HandleFunc("/api/export/day", proxy.handleExportDay)
+	mux.HandleFunc("/api/export/download", proxy.handleExportDownload)
 
 	// Health check
 	if cfg.Monitoring.EnableHealth {
@@ -1851,6 +1861,167 @@ func (p *Proxy) handleModels(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(response)
 }
 
+// handleExportDates lists dates with available log data in the storage directory.
+func (p *Proxy) handleExportDates(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	entries, err := os.ReadDir(p.config.Storage.Directory)
+	if err != nil {
+		http.Error(w, "Failed to read storage directory", http.StatusInternalServerError)
+		return
+	}
+
+	var dates []map[string]interface{}
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		if _, err := time.Parse("20060102", name); err != nil {
+			continue
+		}
+		datePath := filepath.Join(p.config.Storage.Directory, name)
+		// Count log files (excluding streams/)
+		fileCount := 0
+		filepath.WalkDir(datePath, func(path string, d os.DirEntry, err error) error {
+			if err != nil {
+				return nil
+			}
+			if d.IsDir() && d.Name() == "streams" {
+				return filepath.SkipDir
+			}
+			if !d.IsDir() && strings.HasSuffix(d.Name(), ".jsonl") {
+				fileCount++
+			}
+			return nil
+		})
+
+		// Check if already exported
+		exported := false
+		exportFileName := ""
+		outDir := p.config.DailyExport.OutputDir
+		if outDir == "" {
+			outDir = "./exports"
+		}
+		prefix := p.config.DailyExport.FilePrefix
+		if prefix == "" {
+			prefix = "dataset-"
+		}
+		exportPath := filepath.Join(outDir, prefix+name+".jsonl")
+		if _, err := os.Stat(exportPath); err == nil {
+			exported = true
+			exportFileName = filepath.Base(exportPath)
+		}
+
+		dates = append(dates, map[string]interface{}{
+			"date":          name,
+			"file_count":    fileCount,
+			"exported":      exported,
+			"export_file":   exportFileName,
+		})
+	}
+
+	// Sort descending by date
+	sort.Slice(dates, func(i, j int) bool {
+		return dates[i]["date"].(string) > dates[j]["date"].(string)
+	})
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"dates": dates,
+	})
+}
+
+// handleExportDay triggers export for a specific day.
+func (p *Proxy) handleExportDay(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	dateStr := r.URL.Query().Get("date")
+	if dateStr == "" {
+		http.Error(w, "Missing 'date' parameter (YYYYMMDD)", http.StatusBadRequest)
+		return
+	}
+
+	day, err := time.Parse("20060102", dateStr)
+	if err != nil {
+		http.Error(w, "Invalid date format, use YYYYMMDD", http.StatusBadRequest)
+		return
+	}
+
+	outDir := p.config.DailyExport.OutputDir
+	if outDir == "" {
+		outDir = "./exports"
+	}
+	prefix := p.config.DailyExport.FilePrefix
+	if prefix == "" {
+		prefix = "dataset-"
+	}
+
+	outPath := filepath.Join(outDir, prefix+dateStr+".jsonl")
+
+	p.exportMu.Lock()
+	p.appLogger.Info("Export triggered via API for date: %s -> %s", dateStr, outPath)
+	n, err := exporter.ExportDay(p.config.Storage.Directory, day, outPath)
+	p.exportMu.Unlock()
+
+	if err != nil {
+		p.appLogger.Error("Export failed for %s: %v", dateStr, err)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"error": err.Error(),
+		})
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"date":         dateStr,
+		"rows":         n,
+		"file":         filepath.Base(outPath),
+		"download_url": "/api/export/download?file=" + filepath.Base(outPath),
+	})
+}
+
+// handleExportDownload serves an exported file for download.
+func (p *Proxy) handleExportDownload(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	fileName := r.URL.Query().Get("file")
+	if fileName == "" {
+		http.Error(w, "Missing 'file' parameter", http.StatusBadRequest)
+		return
+	}
+
+	// Prevent path traversal
+	fileName = filepath.Base(fileName)
+
+	outDir := p.config.DailyExport.OutputDir
+	if outDir == "" {
+		outDir = "./exports"
+	}
+
+	filePath := filepath.Join(outDir, fileName)
+
+	if _, err := os.Stat(filePath); os.IsNotExist(err) {
+		http.Error(w, "File not found", http.StatusNotFound)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/x-jsonlines")
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", fileName))
+	http.ServeFile(w, r, filePath)
+}
+
 // createAuthMiddleware creates authentication middleware
 func (p *Proxy) createAuthMiddleware() func(http.HandlerFunc) http.HandlerFunc {
 	return func(next http.HandlerFunc) http.HandlerFunc {
@@ -2317,7 +2488,7 @@ func (p *Proxy) getHTTPClient(modelName string) *http.Client {
 			return c
 		}
 	}
-	return &http.Client{Timeout: 300 * time.Second}
+	return &http.Client{}
 }
 
 func (w *noWriteStatusCapturingWriter) Flush() {
