@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"sort"
+	"sync"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -37,6 +38,9 @@ type Proxy struct {
 	metrics   *Metrics
 	authMw    func(http.HandlerFunc) http.HandlerFunc
 	appLogger *logger.Logger
+
+	// conversationTracker maps sessionID -> full message chain for multi-turn context
+	conversations sync.Map
 }
 
 // New creates a new proxy instance
@@ -136,6 +140,86 @@ func (p *Proxy) generateRequestID() string {
 	return "req_" + nextUniqueID()
 }
 
+// getConversationHistory retrieves the message chain for a session, creating one if absent.
+func (p *Proxy) getConversationHistory(sessionID string) []storage.MessageLog {
+	val, _ := p.conversations.LoadOrStore(sessionID, []storage.MessageLog{})
+	return val.([]storage.MessageLog)
+}
+
+// appendConversation appends new assistant messages to a session'''s conversation chain.
+func (p *Proxy) appendConversation(sessionID string, userMsgs []storage.MessageLog, assistantMsg storage.MessageLog) {
+	val, _ := p.conversations.Load(sessionID)
+	history := []storage.MessageLog{}
+	if val != nil {
+		history = append(history, val.([]storage.MessageLog)...)
+	}
+	history = append(history, userMsgs...)
+	if assistantMsg.Role != "" {
+		history = append(history, assistantMsg)
+	}
+	p.conversations.Store(sessionID, history)
+}
+
+// extractAndUpdateConversation extracts messages from request, assembles full conversation,
+// and returns (messages, systemPrompt, turnIndex, conversationID).
+func (p *Proxy) extractAndUpdateConversation(sessionID string, reqBody map[string]interface{}, provider string) ([]storage.MessageLog, string, int, string) {
+	convID := "conv_" + sessionID
+	messages, systemPrompt, _ := storage.ExtractMessagesFromRequest(reqBody)
+	if len(messages) == 0 {
+		return nil, systemPrompt, 0, convID
+	}
+	history := p.getConversationHistory(sessionID)
+	turnIndex := len(history) + 1
+
+	// Build the full conversation: history + new user messages
+	fullMessages := make([]storage.MessageLog, len(history))
+	copy(fullMessages, history)
+
+	return fullMessages, systemPrompt, turnIndex, convID
+}
+
+// getSessionID returns the session ID from request header or model name.
+func (p *Proxy) getSessionID(r *http.Request, modelName string, isStream bool) string {
+	if sid := r.Header.Get("X-Session-ID"); sid != "" {
+		return sid
+	}
+	sessionID := "session_" + modelName
+	if isStream {
+		sessionID += "_stream"
+	}
+	return sessionID
+}
+
+// buildAssistantMessage constructs a MessageLog from a parsed OpenAI-style response.
+func (p *Proxy) buildAssistantMessage(respParsed map[string]interface{}) storage.MessageLog {
+	if len(respParsed) == 0 {
+		return storage.MessageLog{}
+	}
+	content := ""
+	reasoning := ""
+	if choices, ok := respParsed["choices"].([]interface{}); ok && len(choices) > 0 {
+		if c0, ok := choices[0].(map[string]interface{}); ok {
+			if msg, ok := c0["message"].(map[string]interface{}); ok {
+				if c, ok := msg["content"].(string); ok {
+					content = c
+				}
+				if rc, ok := msg["reasoning_content"].(string); ok {
+					reasoning = rc
+				} else if rc, ok := msg["reasoning"].(string); ok {
+					reasoning = rc
+				}
+			}
+		}
+	}
+	if content == "" && reasoning == "" {
+		return storage.MessageLog{}
+	}
+	return storage.MessageLog{
+		Role:      "assistant",
+		Content:   content,
+		Reasoning: reasoning,
+	}
+}
 // handleRequest creates an HTTP handler for a specific endpoint
 func (p *Proxy) handleRequest(endpoint string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -262,6 +346,8 @@ func (p *Proxy) handleRequest(endpoint string) http.HandlerFunc {
 		}
 
 		// Non-streaming response
+		sessionID := p.getSessionID(r, modelName, false)
+		conversationMessages, systemPrompt, turnIndex, conversationID := p.extractAndUpdateConversation(sessionID, reqBody, modelName)
 		upstreamCallID := "up_" + nextUniqueID()
 		upstreamStart := time.Now()
 		retryCount := r.Header.Get("X-Stainless-Retry-Count")
@@ -287,7 +373,7 @@ func (p *Proxy) handleRequest(endpoint string) http.HandlerFunc {
 				upstreamCallID, time.Since(upstreamStart), err,
 			)
 			requestLogger.Error("Proxy request failed: %v", err)
-			p.logRequest(reqBody, modelName, endpoint, start, 500, nil, true, err.Error(), nil, requestLogger)
+			p.logRequestFull(reqBody, conversationMessages, systemPrompt, sessionID, conversationID, turnIndex, modelName, endpoint, start, 500, nil, nil, false, err.Error(), nil, requestLogger)
 			http.Error(w, "Proxy error: "+err.Error(), http.StatusBadGateway)
 			return
 		}
@@ -311,7 +397,7 @@ func (p *Proxy) handleRequest(endpoint string) http.HandlerFunc {
 				return
 			}
 			requestLogger.Error("Failed to read LLM API response: %v", err)
-			p.logRequest(reqBody, modelName, endpoint, start, resp.StatusCode, nil, false, err.Error(), nil, requestLogger)
+			p.logRequestFull(reqBody, conversationMessages, systemPrompt, sessionID, conversationID, turnIndex, modelName, endpoint, start, resp.StatusCode, nil, nil, false, err.Error(), nil, requestLogger)
 			http.Error(w, "Failed to read response", http.StatusBadGateway)
 			return
 		}
@@ -331,7 +417,21 @@ func (p *Proxy) handleRequest(endpoint string) http.HandlerFunc {
 		if p.shouldLogUpstreamHTTP() {
 			p.logHTTPUpstreamResponseFull(requestLogger, upstreamCallID, resp, respBody)
 		}
-		p.logRequest(reqBody, modelName, endpoint, start, resp.StatusCode, respBody, false, "", tokensUsed, requestLogger)
+		p.logRequestFull(reqBody, conversationMessages, systemPrompt, sessionID, conversationID, turnIndex, modelName, endpoint, start, resp.StatusCode, respBody, nil, false, "", tokensUsed, requestLogger)
+		// Update conversation history with assistant response
+		assistantMsg := p.buildAssistantMessage(respParsed)
+		if assistantMsg.Role != "" {
+			userMsgs := make([]storage.MessageLog, 0)
+			if msgs, _, _ := storage.ExtractMessagesFromRequest(reqBody); msgs != nil {
+				for _, m := range msgs {
+					if m.Role == "user" || m.Role == "tool" {
+						userMsgs = append(userMsgs, m)
+					}
+				}
+			}
+			p.appendConversation(sessionID, userMsgs, assistantMsg)
+		}
+
 
 		// Log response details
 		duration := time.Since(start)
@@ -1160,6 +1260,7 @@ func (p *Proxy) handleAnthropicPassthroughStream(w http.ResponseWriter, r *http.
 
 	streamBytes := 0
 	chunkCount := 0
+	aggregatedStreamBytes := make([]byte, 0, 4096)
 	buf := make([]byte, 4096)
 	for {
 		select {
@@ -1170,6 +1271,7 @@ func (p *Proxy) handleAnthropicPassthroughStream(w http.ResponseWriter, r *http.
 		n, readErr := resp.Body.Read(buf)
 		if n > 0 {
 			w.Write(buf[:n])
+			aggregatedStreamBytes = append(aggregatedStreamBytes, buf[:n]...)
 			flusher.Flush()
 			chunkCount++
 			streamBytes += n
@@ -1187,7 +1289,9 @@ func (p *Proxy) handleAnthropicPassthroughStream(w http.ResponseWriter, r *http.
 	}
 
 	var anthropicReq map[string]interface{}
+	// aggregatedStreamBytes already declared above	var anthropicReq map[string]interface{}
 	json.Unmarshal(rawBody, &anthropicReq)
+	// Save with aggregated response body for dataset quality
 	p.logRequest(anthropicReq, modelName, "messages", start, resp.StatusCode, nil, true, "", nil, requestLogger)
 }
 
@@ -1247,6 +1351,8 @@ func (p *Proxy) handleStreaming(w http.ResponseWriter, r *http.Request, proxyReq
 	// Read and forward stream
 	chunkCount := 0
 	totalBytes := 0
+	aggregatedContent := ""
+	aggregatedReasoning := ""
 
 	scanner := make([]byte, 8192)
 	for {
@@ -1297,6 +1403,27 @@ func (p *Proxy) handleStreaming(w http.ResponseWriter, r *http.Request, proxyReq
 						jsonPart := line[idxStart : idxEnd+1]
 						normalized := p.normalizeStreamChunk(jsonPart)
 						if len(normalized) != len(jsonPart) {
+							// Accumulate content and reasoning for aggregated response
+							if bytes.HasPrefix(chunkToWrite, []byte("data: ")) {
+								if jsonStart := bytes.Index(chunkToWrite[6:], []byte("{")); jsonStart >= 0 {
+									var sseChunk map[string]interface{}
+									if json.Unmarshal(chunkToWrite[6+jsonStart:], &sseChunk) == nil {
+										if choices, ok := sseChunk["choices"].([]interface{}); ok && len(choices) > 0 {
+											if c0, ok := choices[0].(map[string]interface{}); ok {
+												if delta, ok := c0["delta"].(map[string]interface{}); ok {
+													if c, ok := delta["content"].(string); ok {
+														aggregatedContent += c
+													}
+													if rc, ok := delta["reasoning_content"].(string); ok {
+														aggregatedReasoning += rc
+													}
+												}
+											}
+										}
+									}
+								}
+							}
+
 							chunkToWrite = normalized
 						}
 					}
@@ -1327,6 +1454,20 @@ func (p *Proxy) handleStreaming(w http.ResponseWriter, r *http.Request, proxyReq
 				requestLogger.Info("Streaming completed: %d chunks, %d bytes total", chunkCount, totalBytes)
 			}
 			break
+		}
+	}
+
+	// Build aggregated response from accumulated chunks
+	if aggregatedContent != "" || aggregatedReasoning != "" {
+		reqLog.AggregatedResponse = map[string]interface{}{
+			"choices": []interface{}{
+				map[string]interface{}{
+					"message": map[string]interface{}{
+						"content": aggregatedContent,
+						"reasoning_content": aggregatedReasoning,
+					},
+				},
+			},
 		}
 	}
 
@@ -1421,6 +1562,43 @@ func (p *Proxy) logRequest(reqBody map[string]interface{}, modelName, endpoint s
 	}
 
 	if !isStream && respBody != nil {
+		var respParsed map[string]interface{}
+		json.Unmarshal(respBody, &respParsed)
+		reqLog.ResponseBody = respParsed
+	}
+
+	if err := p.logger.SaveRequest(reqLog); err != nil {
+		if requestLogger != nil {
+			requestLogger.Error("Failed to save request log: %v", err)
+		}
+	}
+}
+
+// logRequestFull logs a request/response pair with full conversation context.
+func (p *Proxy) logRequestFull(reqBody map[string]interface{}, messages []storage.MessageLog, systemPrompt, sessionID, conversationID string, turnIndex int, modelName, endpoint string, start time.Time, statusCode int, respBody []byte, aggregatedResponse map[string]interface{}, isStream bool, errorMsg string, tokensUsed map[string]int, requestLogger *logger.Logger) {
+	reqLog := &storage.RequestLog{
+		ID:                 "req_" + nextUniqueID(),
+		Timestamp:          time.Now(),
+		SessionID:          sessionID,
+		ConversationID:     conversationID,
+		TurnIndex:          turnIndex,
+		Endpoint:           endpoint,
+		Method:             "POST",
+		Model:              modelName,
+		Provider:           modelName,
+		SystemPrompt:       systemPrompt,
+		Messages:           messages,
+		RequestBody:        reqBody,
+		StatusCode:         statusCode,
+		Stream:             isStream,
+		Duration:           time.Since(start).String(),
+		Error:              errorMsg,
+		TokensUsed:         tokensUsed,
+	}
+
+	if aggregatedResponse != nil {
+		reqLog.AggregatedResponse = aggregatedResponse
+	} else if !isStream && respBody != nil {
 		var respParsed map[string]interface{}
 		json.Unmarshal(respBody, &respParsed)
 		reqLog.ResponseBody = respParsed

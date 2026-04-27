@@ -14,18 +14,44 @@ import (
 	"time"
 )
 
-// RequestLog represents a single request/response pair
+// MessageLog represents a single message in a conversation chain.
+type MessageLog struct {
+	Role      string        `json:"role"`
+	Content   string        `json:"content"`
+	Reasoning string        `json:"reasoning,omitempty"`
+	ToolCalls []ToolCallLog `json:"tool_calls,omitempty"`
+}
+
+// ToolCallLog represents a tool call within a message.
+type ToolCallLog struct {
+	ID       string           `json:"id"`
+	Type     string           `json:"type"`
+	Function FunctionCallLog  `json:"function"`
+}
+
+// FunctionCallLog represents a function call details.
+type FunctionCallLog struct {
+	Name      string `json:"name"`
+	Arguments string `json:"arguments"`
+}
+
+// RequestLog represents a single request/response pair with full conversation context.
 type RequestLog struct {
 	ID           string                 `json:"id"`
 	Timestamp    time.Time              `json:"timestamp"`
 	SessionID    string                 `json:"session_id"`
+	ConversationID string               `json:"conversation_id,omitempty"`
+	TurnIndex    int                    `json:"turn_index,omitempty"`
 	Endpoint     string                 `json:"endpoint"`
 	Method       string                 `json:"method"`
 	Model        string                 `json:"model"`
 	Provider     string                 `json:"provider"`
+	SystemPrompt string                 `json:"system_prompt,omitempty"`
+	Messages     []MessageLog           `json:"messages,omitempty"`
 	RequestBody  map[string]interface{} `json:"request_body"`
 	StatusCode   int                    `json:"status_code,omitempty"`
 	ResponseBody map[string]interface{} `json:"response_body,omitempty"`
+	AggregatedResponse map[string]interface{} `json:"aggregated_response,omitempty"`
 	Stream       bool                   `json:"stream"`
 	Duration     string                 `json:"duration"`
 	Error        string                 `json:"error,omitempty"`
@@ -211,6 +237,202 @@ func (l *Logger) ReadLog(filePath string) ([]json.RawMessage, error) {
 	}
 
 	return entries, nil
+}
+
+// ExtractMessagesFromRequest extracts MessageLog entries, system prompt, and the remaining
+// request body from an OpenAI-style or Anthropic-style request map.
+// Returns messages, systemPrompt, and a cleaned requestBody (with messages removed).
+func ExtractMessagesFromRequest(reqBody map[string]interface{}) (messages []MessageLog, systemPrompt string, cleanedBody map[string]interface{}) {
+	if reqBody == nil {
+		return nil, "", nil
+	}
+
+	// Copy to avoid mutating the original
+	cleanedBody = make(map[string]interface{}, len(reqBody))
+	for k, v := range reqBody {
+		cleanedBody[k] = v
+	}
+
+	// Try OpenAI-style: request.messages[]
+	if msgsRaw, exists := reqBody["messages"]; exists {
+		if msgsArr, ok := msgsRaw.([]interface{}); ok {
+			messages = make([]MessageLog, 0, len(msgsArr))
+			for _, m := range msgsArr {
+				msg, ok := m.(map[string]interface{})
+				if !ok {
+					continue
+				}
+				role, _ := msg["role"].(string)
+				content := extractTextContent(msg["content"])
+
+				ml := MessageLog{Role: role, Content: content}
+
+				// Extract reasoning/thinking from assistant messages
+				if role == "assistant" {
+					if rc, ok := msg["reasoning_content"].(string); ok && rc != "" {
+						ml.Reasoning = rc
+					} else if rc, ok := msg["reasoning"].(string); ok && rc != "" {
+						ml.Reasoning = rc
+					}
+					// Extract tool calls
+					if tcRaw, exists := msg["tool_calls"]; exists {
+						if tcArr, ok := tcRaw.([]interface{}); ok {
+							toolCalls := make([]ToolCallLog, 0, len(tcArr))
+							for _, tc := range tcArr {
+								tcMap, ok := tc.(map[string]interface{})
+								if !ok {
+									continue
+								}
+								tcl := ToolCallLog{
+									ID:   getStringField(tcMap, "id"),
+									Type: getStringField(tcMap, "type"),
+								}
+								if fnRaw, exists := tcMap["function"]; exists {
+									if fnMap, ok := fnRaw.(map[string]interface{}); ok {
+										tcl.Function = FunctionCallLog{
+											Name:      getStringField(fnMap, "name"),
+											Arguments: getStringField(fnMap, "arguments"),
+										}
+									}
+								}
+								toolCalls = append(toolCalls, tcl)
+							}
+							ml.ToolCalls = toolCalls
+						}
+					}
+				}
+
+				if role == "system" && systemPrompt == "" {
+					systemPrompt = content
+					continue // don't add system to messages chain
+				}
+				messages = append(messages, ml)
+			}
+			delete(cleanedBody, "messages")
+		}
+	}
+
+	// Try Anthropic-style: system field (could be string or content block)
+	if systemPrompt == "" {
+		if sys, ok := reqBody["system"].(string); ok && sys != "" {
+			systemPrompt = sys
+		}
+	}
+
+	// Try Anthropic-style: request.messages[] with content blocks
+	if len(messages) == 0 {
+		if msgsRaw, exists := reqBody["messages"]; exists {
+			if msgsArr, ok := msgsRaw.([]interface{}); ok {
+				messages = make([]MessageLog, 0, len(msgsArr))
+				for _, m := range msgsArr {
+					msg, ok := m.(map[string]interface{})
+					if !ok {
+						continue
+					}
+					role, _ := msg["role"].(string)
+					content := extractAnthropicTextContent(msg["content"])
+					ml := MessageLog{Role: role, Content: content}
+
+					if role == "assistant" {
+						thinking := extractAnthropicThinkingContent(msg["content"])
+						if thinking != "" {
+							ml.Reasoning = thinking
+						}
+					}
+					messages = append(messages, ml)
+				}
+			}
+		}
+	}
+
+	return messages, systemPrompt, cleanedBody
+}
+
+// extractTextContent extracts text from various content field formats.
+func extractTextContent(content interface{}) string {
+	switch c := content.(type) {
+	case string:
+		return c
+	case []interface{}:
+		var parts []string
+		for _, item := range c {
+			block, ok := item.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			blockType, _ := block["type"].(string)
+			if blockType != "text" && blockType != "" {
+				continue
+			}
+			if text, ok := block["text"].(string); ok {
+				parts = append(parts, text)
+			}
+		}
+		return strings.Join(parts, "\n")
+	default:
+		return ""
+	}
+}
+
+// extractAnthropicTextContent reads Anthropic content blocks and returns merged text.
+func extractAnthropicTextContent(content interface{}) string {
+	switch c := content.(type) {
+	case string:
+		return c
+	case []interface{}:
+		var parts []string
+		for _, item := range c {
+			block, ok := item.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			blockType, _ := block["type"].(string)
+			if blockType != "text" && blockType != "" {
+				continue
+			}
+			if text, ok := block["text"].(string); ok && strings.TrimSpace(text) != "" {
+				parts = append(parts, text)
+			}
+		}
+		return strings.Join(parts, "\n")
+	default:
+		return ""
+	}
+}
+
+// extractAnthropicThinkingContent extracts thinking blocks from Anthropic content.
+func extractAnthropicThinkingContent(content interface{}) string {
+	blocks, ok := content.([]interface{})
+	if !ok {
+		return ""
+	}
+	var parts []string
+	for _, b := range blocks {
+		block, ok := b.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		blockType, _ := block["type"].(string)
+		if blockType != "thinking" {
+			continue
+		}
+		if text, ok := block["thinking"].(string); ok && strings.TrimSpace(text) != "" {
+			parts = append(parts, text)
+		} else if text, ok := block["text"].(string); ok && strings.TrimSpace(text) != "" {
+			parts = append(parts, text)
+		}
+	}
+	return strings.Join(parts, "\n")
+}
+
+// getStringField safely extracts a string field from a map.
+func getStringField(m map[string]interface{}, key string) string {
+	if v, exists := m[key]; exists {
+		if s, ok := v.(string); ok {
+			return s
+		}
+	}
+	return ""
 }
 
 func (l *Logger) buildFileName(req *RequestLog) string {

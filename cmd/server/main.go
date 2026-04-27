@@ -206,11 +206,18 @@ func runDailyExport(ctx context.Context, cfg *config.Config, appLogger *logger.L
 		y := time.Now().In(loc).AddDate(0, 0, -1)
 		day := time.Date(y.Year(), y.Month(), y.Day(), 12, 0, 0, 0, loc)
 		outPath := filepath.Join(outDir, prefix+y.Format("20060102")+".jsonl")
-		n, err := exporter.ExportDay(cfg.Storage.Directory, day, outPath)
-		if err != nil {
-			appLogger.Warn("daily export: %v", err)
+		var n int
+		var exportErr error
+		switch strings.ToLower(c.ExportFormat) {
+		case "messages":
+			n, exportErr = exporter.ExportMessagesDay(cfg.Storage.Directory, day, outPath)
+		default:
+			n, exportErr = exporter.ExportDay(cfg.Storage.Directory, day, outPath)
+		}
+		if exportErr != nil {
+			appLogger.Warn("daily export: %v", exportErr)
 			continue
 		}
-		appLogger.Info("daily export: %d rows -> %s", n, outPath)
+		appLogger.Info("daily export (%s): %d rows -> %s", c.ExportFormat, n, outPath)
 	}
 }

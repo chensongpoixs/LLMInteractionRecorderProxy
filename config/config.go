@@ -65,12 +65,13 @@ type LoggingConfig struct {
 // DailyExportConfig runs once per day to merge JSONL logs for the previous calendar day
 // into a single file matching the reference dataset line shape.
 type DailyExportConfig struct {
-	Enable     bool   `yaml:"enable"`
-	OutputDir  string `yaml:"output_dir"`
-	FilePrefix string `yaml:"file_prefix"`
-	RunHour    int    `yaml:"run_hour"`   // 0–23, in Timezone
-	RunMinute  int    `yaml:"run_minute"` // 0–59, in Timezone
-	Timezone   string `yaml:"timezone"`   // e.g. "Local", "Asia/Shanghai" (empty = Local)
+	Enable       bool   `yaml:"enable"`
+	OutputDir    string `yaml:"output_dir"`
+	FilePrefix   string `yaml:"file_prefix"`
+	ExportFormat string `yaml:"export_format"` // "reasoning" (default) or "messages" (OpenAI fine-tuning format)
+	RunHour      int    `yaml:"run_hour"`      // 0–23, in Timezone
+	RunMinute    int    `yaml:"run_minute"`    // 0–59, in Timezone
+	Timezone     string `yaml:"timezone"`      // e.g. "Local", "Asia/Shanghai" (empty = Local)
 }
 
 // Config is the root configuration structure
@@ -211,12 +212,13 @@ func DefaultConfig() *Config {
 			UpstreamLogMaxBytes: 0,
 		},
 		DailyExport: DailyExportConfig{
-			Enable:     false,
-			OutputDir:  "./exports",
-			FilePrefix: "Opus-4.6-Reasoning-3000x-filtered-",
-			RunHour:    0,
-			RunMinute:  5,
-			Timezone:   "Local",
+			Enable:       false,
+			OutputDir:    "./exports",
+			FilePrefix:   "Opus-4.6-Reasoning-3000x-filtered-",
+			ExportFormat: "reasoning",
+			RunHour:      0,
+			RunMinute:    5,
+			Timezone:     "Local",
 		},
 	}
 }

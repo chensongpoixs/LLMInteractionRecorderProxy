@@ -20,58 +20,43 @@ import (
 type DatasetRow struct {
 	ID         string `json:"id"`
 	Problem    string `json:"problem"`
+	System     string `json:"system,omitempty"`
 	Thinking   string `json:"thinking"`
 	Solution   string `json:"solution"`
 	Difficulty string `json:"difficulty"`
 	Category   string `json:"category"`
+	Model      string `json:"model,omitempty"`
+	Provider   string `json:"provider,omitempty"`
 	Timestamp  string `json:"timestamp"`
 	Hash       string `json:"hash"`
+	Source     string `json:"source"`
+}
+
+// MessagesRow is the OpenAI fine-tuning compatible format.
+type MessagesRow struct {
+	Messages []MessageEntry `json:"messages"`
+}
+
+// MessageEntry is a single message in the OpenAI format.
+type MessageEntry struct {
+	Role      string `json:"role"`
+	Content   string `json:"content"`
+	Reasoning string `json:"reasoning,omitempty"`
 }
 
 var systemReminderRE = regexp.MustCompile(`(?s)<system-reminder>.*?</system-reminder>`)
 
-// ExportDay aggregates all request logs under storageDir/YYYYMMDD into one JSONL file.
-// outputPath is the full path of the target file (e.g. .../Opus-4.6-Reasoning-3000x-filtered-20260425.jsonl).
+// ExportDay aggregates all request logs under storageDir/YYYYMMDD into one JSONL file
+// in the improved reasoning format.
 func ExportDay(storageDir string, day time.Time, outputPath string) (n int, err error) {
-	// Use calendar day of `day` in its Location (callers should pass a wall-clock day, e.g. noon).
 	dateStr := day.Format("20060102")
 	dayDir := filepath.Join(storageDir, dateStr)
 	if st, e := os.Stat(dayDir); e != nil || !st.IsDir() {
 		return 0, fmt.Errorf("day directory not found: %s", dayDir)
 	}
 
-	// Collect request log file paths (exclude streams/)
-	var logFiles []string
-	err = filepath.WalkDir(dayDir, func(path string, d os.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		if d.IsDir() {
-			if path != dayDir && strings.Contains(path, "streams") {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		if !strings.HasSuffix(path, ".jsonl") {
-			return nil
-		}
-		if strings.Contains(path, string(filepath.Separator)+"streams"+string(filepath.Separator)) {
-			return nil
-		}
-		logFiles = append(logFiles, path)
-		return nil
-	})
-	if err != nil {
-		return 0, err
-	}
-	sort.Strings(logFiles)
-
-	// Pre-load stream chunks for this day (keyed by request id from proxy log)
-	streamIndex, sErr := buildStreamIndex(filepath.Join(dayDir, "streams"))
-	if sErr != nil {
-		// non-fatal: streaming aggregation may be empty
-		_ = sErr
-	}
+	logFiles := collectLogFiles(dayDir)
+	streamIndex, _ := buildStreamIndex(filepath.Join(dayDir, "streams"))
 
 	if err := os.MkdirAll(filepath.Dir(outputPath), 0755); err != nil {
 		return 0, err
@@ -91,7 +76,6 @@ func ExportDay(storageDir string, day time.Time, outputPath string) (n int, err 
 			continue
 		}
 		sc := bufio.NewScanner(f)
-		// allow long lines
 		buf := make([]byte, 0, 64*1024)
 		sc.Buffer(buf, 16*1024*1024)
 		for sc.Scan() {
@@ -103,8 +87,7 @@ func ExportDay(storageDir string, day time.Time, outputPath string) (n int, err 
 			if json.Unmarshal(b, &rec) != nil {
 				continue
 			}
-			// keep stream or successful entries; drop hard failures with no data
-			if rec.Error != "" && rec.ResponseBody == nil && !rec.Stream {
+			if rec.Error != "" && rec.ResponseBody == nil && rec.AggregatedResponse == nil && !rec.Stream {
 				continue
 			}
 
@@ -112,7 +95,6 @@ func ExportDay(storageDir string, day time.Time, outputPath string) (n int, err 
 			if !ok {
 				continue
 			}
-			// de-dup by hash
 			if _, exists := seen[row.Hash]; exists {
 				continue
 			}
@@ -132,6 +114,106 @@ func ExportDay(storageDir string, day time.Time, outputPath string) (n int, err 
 		return 0, nil
 	}
 	return n, nil
+}
+
+// ExportMessagesDay exports in OpenAI messages format (fine-tuning compatible).
+func ExportMessagesDay(storageDir string, day time.Time, outputPath string) (n int, err error) {
+	dateStr := day.Format("20060102")
+	dayDir := filepath.Join(storageDir, dateStr)
+	if st, e := os.Stat(dayDir); e != nil || !st.IsDir() {
+		return 0, fmt.Errorf("day directory not found: %s", dayDir)
+	}
+
+	logFiles := collectLogFiles(dayDir)
+
+	if err := os.MkdirAll(filepath.Dir(outputPath), 0755); err != nil {
+		return 0, err
+	}
+	out, err := os.Create(outputPath)
+	if err != nil {
+		return 0, err
+	}
+	defer out.Close()
+
+	enc := json.NewEncoder(out)
+	seen := make(map[string]struct{})
+
+	for _, lf := range logFiles {
+		f, e := os.Open(lf)
+		if e != nil {
+			continue
+		}
+		sc := bufio.NewScanner(f)
+		buf := make([]byte, 0, 64*1024)
+		sc.Buffer(buf, 16*1024*1024)
+		for sc.Scan() {
+			b := sc.Bytes()
+			if len(b) == 0 {
+				continue
+			}
+			var rec storage.RequestLog
+			if json.Unmarshal(b, &rec) != nil {
+				continue
+			}
+			if rec.Error != "" && rec.ResponseBody == nil && rec.AggregatedResponse == nil && !rec.Stream {
+				continue
+			}
+
+			row, ok := buildMessagesRow(&rec)
+			if !ok {
+				continue
+			}
+			rowBytes, _ := json.Marshal(row)
+			h := sha256.Sum256(rowBytes)
+			hashKey := hex.EncodeToString(h[:])
+			if len(hashKey) > 16 {
+				hashKey = hashKey[:16]
+			}
+			if _, exists := seen[hashKey]; exists {
+				continue
+			}
+			seen[hashKey] = struct{}{}
+			if err := enc.Encode(row); err != nil {
+				f.Close()
+				return n, err
+			}
+			n++
+		}
+		_ = f.Close()
+	}
+
+	if n == 0 {
+		_ = out.Close()
+		_ = os.Remove(outputPath)
+		return 0, nil
+	}
+	return n, nil
+}
+
+// collectLogFiles returns all .jsonl log files excluding stream chunk files under streams/.
+func collectLogFiles(dayDir string) []string {
+	var logFiles []string
+	filepath.WalkDir(dayDir, func(path string, d os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return nil
+		}
+		if d.IsDir() {
+			if path != dayDir && strings.Contains(path, "streams") {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(path, ".jsonl") {
+			return nil
+		}
+		if strings.Contains(path, string(filepath.Separator)+"streams"+string(filepath.Separator)) {
+			return nil
+		}
+		logFiles = append(logFiles, path)
+		return nil
+	})
+	sort.Strings(logFiles)
+	return logFiles
 }
 
 // buildStreamIndex returns reqID -> ordered chunks of raw SSE.
@@ -173,7 +255,7 @@ func buildRow(rec *storage.RequestLog, streamIndex map[string][]string) (Dataset
 	if rec.RequestBody == nil {
 		return DatasetRow{}, false
 	}
-	problem := extractProblem(rec.RequestBody)
+	problem := extractProblem(rec.RequestBody, rec.SystemPrompt)
 	problem = strings.TrimSpace(systemReminderRE.ReplaceAllString(problem, ""))
 	problem = strings.TrimSpace(problem)
 	if problem == "" {
@@ -185,13 +267,16 @@ func buildRow(rec *storage.RequestLog, streamIndex map[string][]string) (Dataset
 	row := DatasetRow{
 		ID:         fmt.Sprintf("proxy_%s", rec.ID),
 		Problem:    problem,
+		System:     rec.SystemPrompt,
 		Thinking:   thinking,
 		Solution:   solution,
-		Difficulty: "medium",
+		Difficulty: inferDifficulty(rec.Model, thinking, solution),
 		Category:   inferCategory(problem, solution, thinking),
+		Model:      rec.Model,
+		Provider:   rec.Provider,
 		Timestamp:  rec.Timestamp.UTC().Format(time.RFC3339Nano),
+		Source:     fmt.Sprintf("proxy-llm/%s", rec.Provider),
 	}
-	// If timestamp invalid / zero, use "now" replacement
 	if strings.HasPrefix(row.Timestamp, "0001-") {
 		row.Timestamp = time.Now().UTC().Format(time.RFC3339Nano)
 	}
@@ -199,25 +284,85 @@ func buildRow(rec *storage.RequestLog, streamIndex map[string][]string) (Dataset
 	return row, true
 }
 
-func extractProblem(req map[string]interface{}) string {
+func buildMessagesRow(rec *storage.RequestLog) (MessagesRow, bool) {
+	messages := make([]MessageEntry, 0, 8)
+
+	// Add system prompt
+	systemContent := strings.TrimSpace(rec.SystemPrompt)
+	if systemContent == "" {
+		if rec.RequestBody != nil {
+			if msgs, system, _ := storage.ExtractMessagesFromRequest(rec.RequestBody); len(msgs) > 0 || system != "" {
+				systemContent = system
+			}
+		}
+	}
+	if systemContent != "" {
+		messages = append(messages, MessageEntry{Role: "system", Content: systemContent})
+	}
+
+	// Add conversation messages if available
+	if len(rec.Messages) > 0 {
+		for _, msg := range rec.Messages {
+			entry := MessageEntry{Role: msg.Role, Content: msg.Content}
+			if msg.Reasoning != "" && msg.Role == "assistant" {
+				entry.Reasoning = msg.Reasoning
+			}
+			messages = append(messages, entry)
+		}
+		return MessagesRow{Messages: messages}, true
+	}
+
+	// Fallback: extract from request/response
+	if rec.RequestBody == nil {
+		return MessagesRow{}, false
+	}
+
+	userContent := extractProblem(rec.RequestBody, rec.SystemPrompt)
+	userContent = strings.TrimSpace(systemReminderRE.ReplaceAllString(userContent, ""))
+	userContent = strings.TrimSpace(userContent)
+	if userContent == "" {
+		return MessagesRow{}, false
+	}
+	messages = append(messages, MessageEntry{Role: "user", Content: userContent})
+
+	thinking, solution := "", ""
+	if rec.AggregatedResponse != nil {
+		thinking, solution = fromAggregatedResponse(rec.AggregatedResponse)
+	}
+	if thinking == "" && solution == "" && rec.ResponseBody != nil {
+		thinking, solution = fromOpenAIStyleResponse(rec.ResponseBody)
+	}
+	if thinking == "" && solution == "" && rec.ResponseBody != nil {
+		thinking, solution = fromAnthropicStyleResponse(rec.ResponseBody)
+	}
+	if solution != "" || thinking != "" {
+		entry := MessageEntry{Role: "assistant", Content: solution}
+		if thinking != "" {
+			entry.Reasoning = thinking
+		}
+		messages = append(messages, entry)
+	}
+
+	return MessagesRow{Messages: messages}, true
+}
+
+func extractProblem(req map[string]interface{}, systemPrompt string) string {
 	if msgs, ok := req["messages"].([]interface{}); ok {
-		return joinUserMessages(msgs)
+		return joinUserMessages(msgs, systemPrompt)
 	}
 	if s, ok := req["system"].(string); ok && s != "" {
 		return s
 	}
-	// Completions
 	if s, ok := req["prompt"].(string); ok {
 		return s
 	}
-	// Single user content (some proxies)
 	if s, ok := req["input"].(string); ok {
 		return s
 	}
 	return ""
 }
 
-func joinUserMessages(msgs []interface{}) string {
+func joinUserMessages(msgs []interface{}, systemPrompt string) string {
 	var parts []string
 	for _, m := range msgs {
 		mm, ok := m.(map[string]interface{})
@@ -226,6 +371,9 @@ func joinUserMessages(msgs []interface{}) string {
 		}
 		role, _ := mm["role"].(string)
 		if role != "user" && role != "system" {
+			continue
+		}
+		if role == "system" && systemPrompt != "" {
 			continue
 		}
 		parts = append(parts, messageText(mm["content"]))
@@ -267,20 +415,65 @@ func messageText(c interface{}) string {
 }
 
 func extractThinkingSolution(rec *storage.RequestLog, streamIndex map[string][]string) (thinking, solution string) {
-	if rec.ResponseBody != nil {
-		thinking, solution = fromOpenAIStyleResponse(rec.ResponseBody)
-		if solution != "" || thinking != "" {
-			return thinking, solution
-		}
-		thinking, solution = fromAnthropicStyleResponse(rec.ResponseBody)
-		if solution != "" || thinking != "" {
-			return thinking, solution
+	// Priority 1: AggregatedResponse (new streaming aggregation)
+	if rec.AggregatedResponse != nil {
+		th, sol := fromAggregatedResponse(rec.AggregatedResponse)
+		if sol != "" || th != "" {
+			return th, sol
 		}
 	}
+
+	// Priority 2: Messages chain (conversation tracking)
+	if len(rec.Messages) > 0 {
+		for i := len(rec.Messages) - 1; i >= 0; i-- {
+			msg := rec.Messages[i]
+			if msg.Role == "assistant" {
+				if msg.Reasoning != "" || msg.Content != "" {
+					return msg.Reasoning, msg.Content
+				}
+			}
+		}
+	}
+
+	// Priority 3: ResponseBody (non-streaming)
+	if rec.ResponseBody != nil {
+		th, sol := fromOpenAIStyleResponse(rec.ResponseBody)
+		if sol != "" || th != "" {
+			return th, sol
+		}
+		th, sol = fromAnthropicStyleResponse(rec.ResponseBody)
+		if sol != "" || th != "" {
+			return th, sol
+		}
+	}
+
+	// Priority 4: Stream chunks
 	if rec.Stream {
 		agg := aggregateFromStreamChunks(streamIndex[rec.ID])
 		th, sol := parseOpenAIStreamAggregate(agg)
 		return th, sol
+	}
+
+	return "", ""
+}
+
+func fromAggregatedResponse(agg map[string]interface{}) (string, string) {
+	if choices, ok := agg["choices"].([]interface{}); ok && len(choices) > 0 {
+		if c0, ok := choices[0].(map[string]interface{}); ok {
+			if msg, ok := c0["message"].(map[string]interface{}); ok {
+				content, _ := msg["content"].(string)
+				reasoning, _ := msg["reasoning_content"].(string)
+				if reasoning == "" {
+					if rc, ok := msg["reasoning"].(string); ok {
+						reasoning = rc
+					}
+				}
+				return strings.TrimSpace(reasoning), strings.TrimSpace(content)
+			}
+		}
+	}
+	if rawSSE, ok := agg["raw_sse"].(string); ok && rawSSE != "" {
+		return parseOpenAIStreamAggregate(rawSSE)
 	}
 	return "", ""
 }
@@ -368,21 +561,41 @@ func aggregateFromStreamChunks(chunks []string) string {
 	if len(chunks) == 0 {
 		return ""
 	}
-	// Chunks are raw slices from upstream; concatenate in file order
 	return strings.Join(chunks, "\n")
+}
+
+func inferDifficulty(model, thinking, solution string) string {
+	lower := strings.ToLower(model)
+	if strings.Contains(lower, "haiku") || strings.Contains(lower, "flash") || strings.Contains(lower, "mini") || strings.Contains(lower, "tiny") || strings.Contains(lower, "small") {
+		return "easy"
+	}
+	if strings.Contains(lower, "sonnet") || strings.Contains(lower, "4o") || strings.Contains(lower, "qwen") || strings.Contains(lower, "gemma") || strings.Contains(lower, "deepseek") {
+		return "medium"
+	}
+	if strings.Contains(lower, "opus") || strings.Contains(lower, "reasoning") || strings.Contains(lower, "claude-4") || strings.Contains(lower, "gpt-4") {
+		return "hard"
+	}
+
+	totalLen := len(thinking) + len(solution)
+	if totalLen > 5000 {
+		return "hard"
+	} else if totalLen > 1000 {
+		return "medium"
+	}
+	return "medium"
 }
 
 func inferCategory(problem, solution, thinking string) string {
 	low := strings.ToLower(problem + "\n" + solution + "\n" + thinking)
-	if strings.Contains(low, "```") || strings.Contains(low, "def ") || strings.Contains(low, "function ") ||
-		strings.Contains(low, "#include") {
+	if strings.Contains(low, "def ") || strings.Contains(low, "function ") ||
+		strings.Contains(low, "#include") || strings.Contains(low, "import ") ||
+		strings.Contains(low, "class ") || strings.Contains(low, "interface ") {
 		return "code"
 	}
-	// heuristics from reference dataset (often "math" even for non-math; default medium + math is common)
 	if strings.Count(low, "$") > 2 || strings.ContainsAny(low, "∫∑√×÷") {
 		return "math"
 	}
-	return "math"
+	return "general"
 }
 
 func recordHash(problem, thinking, solution string) string {
