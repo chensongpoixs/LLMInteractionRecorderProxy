@@ -399,6 +399,7 @@ func (p *Proxy) handleAnthropicMessages() http.HandlerFunc {
 
 		chatReq["messages"] = convertAnthropicMessagesToOpenAI(anthropicReq)
 		applyAnthropicToolsToOpenAI(anthropicReq, chatReq)
+		applyAnthropicReasoningToOpenAI(anthropicReq, chatReq)
 
 		translatedModelName := modelName
 		if cfg := p.getModelByProxyName(modelName); cfg != nil {
@@ -486,6 +487,7 @@ func (p *Proxy) handleAnthropicMessages() http.HandlerFunc {
 		p.logRequest(chatReq, modelName, "messages", start, resp.StatusCode, normalizedBody, false, "", tokensUsed, requestLogger)
 
 		textContent := ""
+		thinkingContent := ""
 		stopReason := "end_turn"
 		toolUseBlocks := make([]map[string]interface{}, 0, 4)
 		if choicesRaw, exists := openAIResp["choices"]; exists {
@@ -504,6 +506,11 @@ func (p *Proxy) handleAnthropicMessages() http.HandlerFunc {
 					if message, ok := choice["message"].(map[string]interface{}); ok {
 						if content, ok := message["content"].(string); ok {
 							textContent = content
+						}
+						if rc, ok := message["reasoning_content"].(string); ok && strings.TrimSpace(rc) != "" {
+							thinkingContent = rc
+						} else if rc, ok := message["reasoning"].(string); ok && strings.TrimSpace(rc) != "" {
+							thinkingContent = rc
 						}
 						toolUseBlocks = extractToolUseBlocksFromOpenAIMessage(message)
 					}
@@ -529,7 +536,13 @@ func (p *Proxy) handleAnthropicMessages() http.HandlerFunc {
 			}
 		}
 
-		contentBlocks := make([]map[string]interface{}, 0, 1+len(toolUseBlocks))
+		contentBlocks := make([]map[string]interface{}, 0, 2+len(toolUseBlocks))
+		if strings.TrimSpace(thinkingContent) != "" {
+			contentBlocks = append(contentBlocks, map[string]interface{}{
+				"type":     "thinking",
+				"thinking": thinkingContent,
+			})
+		}
 		if strings.TrimSpace(textContent) != "" {
 			contentBlocks = append(contentBlocks, map[string]interface{}{
 				"type": "text",
@@ -640,6 +653,8 @@ func (p *Proxy) handleAnthropicMessagesStream(w http.ResponseWriter, r *http.Req
 	streamChunks := 0
 	streamParseErrors := 0
 	textDeltaCount := 0
+	thinkingDeltaCount := 0
+	aggregatedThinking := strings.Builder{}
 	toolCallDeltaCount := 0
 	inputJSONDeltaCount := 0
 	streamEndReason := "completed"
@@ -654,7 +669,7 @@ func (p *Proxy) handleAnthropicMessagesStream(w http.ResponseWriter, r *http.Req
 	toolCallOrder := make([]int, 0, 4)
 	defer func() {
 		requestLogger.Info(
-			"Messages stream summary: call_id=%s status=%d end_reason=%s stop_reason=%s elapsed=%v lines=%d chunks=%d parse_errors=%d text_deltas=%d tool_call_deltas=%d input_json_deltas=%d tool_uses=%d text_len=%d prompt_tokens=%d completion_tokens=%d total_tokens=%d err=%s",
+			"Messages stream summary: call_id=%s status=%d end_reason=%s stop_reason=%s elapsed=%v lines=%d chunks=%d parse_errors=%d text_deltas=%d thinking_deltas=%d tool_call_deltas=%d input_json_deltas=%d tool_uses=%d text_len=%d prompt_tokens=%d completion_tokens=%d total_tokens=%d err=%s",
 			upstreamCallID,
 			resp.StatusCode,
 			streamEndReason,
@@ -664,6 +679,7 @@ func (p *Proxy) handleAnthropicMessagesStream(w http.ResponseWriter, r *http.Req
 			streamChunks,
 			streamParseErrors,
 			textDeltaCount,
+			thinkingDeltaCount,
 			toolCallDeltaCount,
 			inputJSONDeltaCount,
 			len(toolCallOrder),
@@ -791,6 +807,13 @@ func (p *Proxy) handleAnthropicMessagesStream(w http.ResponseWriter, r *http.Req
 									},
 								})
 							}
+							if rc, ok := delta["reasoning_content"].(string); ok && strings.TrimSpace(rc) != "" {
+								aggregatedThinking.WriteString(rc)
+								thinkingDeltaCount++
+							} else if rc, ok := delta["reasoning"].(string); ok && strings.TrimSpace(rc) != "" {
+								aggregatedThinking.WriteString(rc)
+								thinkingDeltaCount++
+							}
 							if tcRaw, hasTC := delta["tool_calls"]; hasTC {
 								toolCallDeltaCount++
 								if tcArr, ok := tcRaw.([]interface{}); ok {
@@ -847,12 +870,42 @@ func (p *Proxy) handleAnthropicMessagesStream(w http.ResponseWriter, r *http.Req
 			"index": 0,
 		})
 	}
+	thinkingContent := strings.TrimSpace(aggregatedThinking.String())
+	if thinkingContent != "" {
+		thinkingIndex := 0
+		if textBlockStarted {
+			thinkingIndex = 1
+		}
+		writeEvent("content_block_start", map[string]interface{}{
+			"type":  "content_block_start",
+			"index": thinkingIndex,
+			"content_block": map[string]interface{}{
+				"type":     "thinking",
+				"thinking": "",
+			},
+		})
+		writeEvent("content_block_delta", map[string]interface{}{
+			"type":  "content_block_delta",
+			"index": thinkingIndex,
+			"delta": map[string]interface{}{
+				"type":     "thinking_delta",
+				"thinking": thinkingContent,
+			},
+		})
+		writeEvent("content_block_stop", map[string]interface{}{
+			"type":  "content_block_stop",
+			"index": thinkingIndex,
+		})
+	}
 	if len(toolCallOrder) > 0 && stopReason != "max_tokens" {
 		stopReason = "tool_use"
 		sort.Ints(toolCallOrder)
 		baseIndex := 0
 		if textBlockStarted {
-			baseIndex = 1
+			baseIndex++
+		}
+		if thinkingContent != "" {
+			baseIndex++
 		}
 		for i, idx := range toolCallOrder {
 			tc := toolCalls[idx]
@@ -1526,10 +1579,14 @@ func convertAnthropicMessagesToOpenAI(req map[string]interface{}) []map[string]i
 		switch role {
 		case "assistant":
 			textContent := extractAnthropicTextContent(content)
+			thinkingContent := extractAnthropicThinkingContent(content)
 			toolCalls := extractOpenAIToolCallsFromAnthropicContent(content)
 			msg := map[string]interface{}{
 				"role":    "assistant",
 				"content": textContent,
+			}
+			if strings.TrimSpace(thinkingContent) != "" {
+				msg["reasoning_content"] = thinkingContent
 			}
 			if len(toolCalls) > 0 {
 				msg["tool_calls"] = toolCalls
@@ -1614,6 +1671,16 @@ func applyAnthropicToolsToOpenAI(req map[string]interface{}, chatReq map[string]
 	}
 }
 
+func applyAnthropicReasoningToOpenAI(req map[string]interface{}, chatReq map[string]interface{}) {
+	// Keep reasoning-related controls for reasoning-capable OpenAI-compatible providers.
+	if v, ok := req["thinking"]; ok {
+		chatReq["thinking"] = v
+	}
+	if v, ok := req["reasoning_effort"]; ok {
+		chatReq["reasoning_effort"] = v
+	}
+}
+
 func extractOpenAIToolCallsFromAnthropicContent(content interface{}) []map[string]interface{} {
 	blocks, ok := content.([]interface{})
 	if !ok {
@@ -1683,6 +1750,36 @@ func extractUserTextAndToolResults(content interface{}) (string, []map[string]in
 		}
 	}
 	return strings.Join(textParts, "\n"), toolResults
+}
+
+func extractAnthropicThinkingContent(content interface{}) string {
+	blocks, ok := content.([]interface{})
+	if !ok {
+		return ""
+	}
+	parts := make([]string, 0, len(blocks))
+	for _, b := range blocks {
+		block, ok := b.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		blockType, _ := block["type"].(string)
+		if blockType != "thinking" {
+			continue
+		}
+		if text, ok := block["thinking"].(string); ok && strings.TrimSpace(text) != "" {
+			parts = append(parts, text)
+			continue
+		}
+		if text, ok := block["text"].(string); ok && strings.TrimSpace(text) != "" {
+			parts = append(parts, text)
+			continue
+		}
+		if text, ok := block["reasoning_content"].(string); ok && strings.TrimSpace(text) != "" {
+			parts = append(parts, text)
+		}
+	}
+	return strings.Join(parts, "\n")
 }
 
 func extractToolUseBlocksFromOpenAIMessage(message map[string]interface{}) []map[string]interface{} {
