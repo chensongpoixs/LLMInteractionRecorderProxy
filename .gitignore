@@ -22,3 +22,5 @@ Thumbs.db
 /proxy-llm
 /capture.pcap
 /logs/app.log
+/config.yaml
+/config.yaml

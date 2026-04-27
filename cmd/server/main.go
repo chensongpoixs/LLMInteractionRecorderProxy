@@ -57,15 +57,15 @@ func main() {
 
 	// Initialize logging system
 	logConfig := &logger.Config{
-		Level:       logLevelFromString(cfg.Logging.Level),
-		File:        cfg.Logging.File,
-		MaxSizeMB:   cfg.Logging.MaxSizeMB,
-		MaxBackups:  cfg.Logging.MaxBackups,
-		MaxAgeDays:  cfg.Logging.MaxAgeDays,
-		Compress:    cfg.Logging.Compress,
-		Console:     cfg.Logging.Console,
-		RequestLog:  cfg.Logging.RequestLog,
-		RequestBody: cfg.Logging.RequestBodyLog,
+		Level:        logLevelFromString(cfg.Logging.Level),
+		File:         cfg.Logging.File,
+		MaxSizeMB:    cfg.Logging.MaxSizeMB,
+		MaxBackups:   cfg.Logging.MaxBackups,
+		MaxAgeDays:   cfg.Logging.MaxAgeDays,
+		Compress:     cfg.Logging.Compress,
+		Console:      cfg.Logging.Console,
+		RequestLog:   cfg.Logging.RequestLog,
+		RequestBody:  cfg.Logging.RequestBodyLog,
 		ResponseBody: cfg.Logging.ResponseBodyLog,
 	}
 

@@ -1,0 +1,117 @@
+# =============================================================================
+# Proxy LLM 配置文件
+# =============================================================================
+#
+# 本代理支持两种上游 API 格式：
+#   1. OpenAI 兼容 API    → 使用 base_url，请求路径如 /v1/chat/completions
+#   2. Anthropic 兼容 API  → 使用 base_url_anthropic，请求路径如 /v1/messages
+#
+# 当模型同时配置了两套 base_url 时：
+#   - 客户端发往 /v1/chat/completions → 使用 base_url（OpenAI 格式透传）
+#   - 客户端发往 /v1/messages          → 使用 base_url_anthropic（Anthropic 格式透传）
+#
+# 如果只配置了 base_url（未配置 base_url_anthropic）：
+#   - /v1/messages 会自动转换为 OpenAI 格式后发往 base_url（兼容模式）
+
+server:
+  host: "0.0.0.0"
+  port: 20901
+  # tls_cert: ""  # TLS 证书路径（可选）
+  # tls_key: ""   # TLS 密钥路径（可选）
+
+# =============================================================================
+# LLM 模型配置
+# =============================================================================
+# 每个模型可配置两套独立的 base_url：
+#   base_url           - OpenAI 兼容端点（/v1/chat/completions, /v1/models 等）
+#   base_url_anthropic - Anthropic 兼容端点（/v1/messages）
+#
+# DeepSeek API 示例：
+#   OpenAI 兼容端点:    https://api.deepseek.com
+#   Anthropic 兼容端点: https://api.deepseek.com/anthropic
+#   模型名: deepseek-v4-pro / deepseek-v4-flash
+models:
+  - name: "DeepSeekV4"
+    base_url: "https://api.deepseek.com"              # OpenAI 兼容端点
+    base_url_anthropic: "https://api.deepseek.com/anthropic"  # Anthropic 兼容端点
+    api_key: "{ANTHROPIC_API_KEY}"                    # 使用环境变量
+    model: "deepseek-v4-flash"
+    timeout: 120s
+    max_retries: 3
+
+  # 仅 OpenAI 兼容的模型（无 Anthropic 端点）示例：
+  # - name: "qwen3.6"
+  #   base_url: "http://js1.blockelite.cn:57700/v1"
+  #   api_key: "sk-not-required"
+  #   model: "qwen3.6-35b-a3b-claude-4.6-opus-reasoning-distilled.q8_0"
+  #   timeout: 300s
+  #   max_retries: 3
+
+  # llama.cpp 本地模型示例：
+  # - name: "local-llama"
+  #   base_url: "http://127.0.0.1:11434/v1"
+  #   api_key: "sk-not-required"
+  #   model: "gemma-4-26B-A4B-it-Q4_K_M"
+  #   timeout: 300s
+  #   max_retries: 3
+  #   llama_api: "/v1/api/chat"
+
+# =============================================================================
+# 存储配置
+# =============================================================================
+storage:
+  directory: "./data"
+  format: "jsonl"       # jsonl 或 json
+  compress: false       # 是否 gzip 压缩
+  rotate: "daily"       # daily / weekly / size
+  max_size: "100mb"
+
+# =============================================================================
+# 代理行为配置
+# =============================================================================
+proxy:
+  enable_stream: true
+  max_body_size: "10mb"
+  rate_limit: 0         # 0 = 不限制
+  enable_cors: true
+  allowed_origins:
+    - "*"
+  enable_auth: false
+  auth_header: "X-API-Key"
+  auth_token: ""
+
+# =============================================================================
+# 监控配置
+# =============================================================================
+monitoring:
+  enable_health: true
+  enable_metrics: true
+  metrics_path: "/metrics"
+
+# =============================================================================
+# 日志配置
+# =============================================================================
+logging:
+  level: "debug"              # debug / info / warn / error
+  file: "./logs/app.log"
+  max_size_mb: 100
+  max_backups: 10
+  max_age_days: 30
+  compress: true
+  console: true
+  request_log: true
+  request_body_log: true
+  response_body_log: true
+  upstream_http_log: true     # 打印客户端→代理→上游 完整 HTTP 信息
+  upstream_log_max_bytes: 262144   # 0 = 256 KiB
+
+# =============================================================================
+# 每日导出配置
+# =============================================================================
+daily_export:
+  enable: true
+  output_dir: "./exports"
+  file_prefix: "Opus-4.6-Reasoning-3000x-filtered-"
+  run_hour: 0
+  run_minute: 5
+  timezone: "Local"

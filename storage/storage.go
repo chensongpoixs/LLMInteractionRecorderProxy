@@ -63,11 +63,11 @@ func NewLogger(dir, format, rotate, maxSize string, compress bool) (*Logger, err
 	}
 
 	return &Logger{
-		dir:    dir,
-		format: format,
-		rotate: rotate,
+		dir:     dir,
+		format:  format,
+		rotate:  rotate,
 		maxSize: maxSize,
-		gzip:   compress,
+		gzip:    compress,
 	}, nil
 }
 

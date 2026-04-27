@@ -7,7 +7,7 @@
 |------|------|
 | **多上游** | 在 `config.yaml` 的 `models` 中配置多条路由；请求体里的 `model` 与配置项 `name` 对应，实际调用上游时使用该项的 `model` 与 `base_url`。 |
 | **OpenAI 兼容** | `/v1/chat/completions`、`/v1/completions`、`/v1/embeddings`、`/v1/models`，以及 llama.cpp 常用的 `/v1/api/chat`（按 chat completions 处理）。 |
-| **Anthropic 风格** | `POST /v1/messages`：入参为 Anthropic 形态，代理侧转换为上游的 chat completions（支持流式 SSE）。 |
+| **Anthropic 原生** | `POST /v1/messages`：支持两种模式 — ① **透传模式**（推荐）：配置 `base_url_anthropic` 后，原始 Anthropic 请求直接转发，不做协议转换；② **兼容模式**（回退）：未配置时自动转换为 OpenAI chat/completions 格式。 |
 | **流式** | 可配置开启 SSE；流式分片单独写入按日目录下的 `streams` 子目录。 |
 | **落盘** | 非流式/元数据与流式 chunk 分文件追加写入 JSONL。 |
 | **可观测** | 健康检查、Prometheus 指标；日志可记录请求体、响应体及「客户端→代理→上游」HTTP 摘要。 |
@@ -28,6 +28,136 @@
 ```
 
 主要代码包：`cmd/server`（入口与定时导出）、`config`、`proxy`、`storage`、`exporter`、`logger`。更细的协作说明见仓库根目录 [CLAUDE.md](./CLAUDE.md)。
+
+## OpenAI 兼容 API 与 Anthropic 兼容 API
+
+本代理同时支持两种上游 API 协议，通过模型配置中的两个独立 base_url 字段区分：
+
+| 配置项 | 作用 | 示例值 |
+|--------|------|--------|
+| `base_url` | OpenAI 兼容端点 | `https://api.deepseek.com` |
+| `base_url_anthropic` | Anthropic 兼容端点 | `https://api.deepseek.com/anthropic` |
+
+### 路由策略
+
+```
+客户端请求                          代理行为
+──────────────────────────────────────────────────────────
+POST /v1/chat/completions   ──►  base_url + /chat/completions   (OpenAI 透传)
+POST /v1/completions         ──►  base_url + /completions        (OpenAI 透传)
+POST /v1/embeddings          ──►  base_url + /embeddings         (OpenAI 透传)
+GET  /v1/models              ──►  返回配置中的模型列表
+
+POST /v1/messages            ──►  若配置 base_url_anthropic:
+                                  → base_url_anthropic + /messages  (Anthropic 原生透传)
+                                  若未配置 base_url_anthropic:
+                                  → 转换为 OpenAI 格式后发往 base_url (兼容模式)
+```
+
+### OpenAI 兼容 API 使用方式
+
+配置模型后，可使用任何 OpenAI 兼容的 SDK 或工具直连代理：
+
+```bash
+# curl 示例 — 非流式
+curl http://127.0.0.1:20901/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer sk-your-key" \
+  -d '{
+    "model": "DeepSeekV4",
+    "messages": [{"role": "user", "content": "Hello!"}],
+    "stream": false
+  }'
+
+# curl 示例 — 流式 (SSE)
+curl -N http://127.0.0.1:20901/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer sk-your-key" \
+  -d '{
+    "model": "DeepSeekV4",
+    "messages": [{"role": "user", "content": "Hello!"}],
+    "stream": true
+  }'
+```
+
+**OpenAI Python SDK 示例：**
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://127.0.0.1:20901/v1",
+    api_key="sk-your-key",
+)
+
+response = client.chat.completions.create(
+    model="DeepSeekV4",
+    messages=[{"role": "user", "content": "Hello!"}],
+)
+print(response.choices[0].message.content)
+```
+
+### Anthropic 兼容 API 使用方式
+
+配置 `base_url_anthropic` 后，可使用 Anthropic SDK 直连代理，请求/响应保持原生 Anthropic Messages 格式：
+
+```bash
+# curl 示例 — Anthropic Messages API
+curl http://127.0.0.1:20901/v1/messages \
+  -H "Content-Type: application/json" \
+  -H "x-api-key: sk-your-key" \
+  -d '{
+    "model": "DeepSeekV4",
+    "max_tokens": 1024,
+    "messages": [{"role": "user", "content": "Hello!"}]
+  }'
+```
+
+**Anthropic Python SDK 示例：**
+
+```python
+import anthropic
+
+client = anthropic.Anthropic(
+    base_url="http://127.0.0.1:20901/v1",
+    api_key="sk-your-key",
+)
+
+message = client.messages.create(
+    model="DeepSeekV4",
+    max_tokens=1024,
+    messages=[{"role": "user", "content": "Hello!"}],
+)
+print(message.content[0].text)
+```
+
+**Claude Code 配置示例**（`~/.claude/settings.json`）：
+
+```json
+{
+  "apiKeyHelper": null,
+  "env": {
+    "ANTHROPIC_API_KEY": "sk-your-key",
+    "ANTHROPIC_BASE_URL": "http://127.0.0.1:20901/v1"
+  }
+}
+```
+
+### DeepSeek 双模式配置示例
+
+DeepSeek 同时提供 OpenAI 和 Anthropic 两套兼容端点，推荐同时配置：
+
+```yaml
+models:
+  - name: "DeepSeekV4"
+    base_url: "https://api.deepseek.com"              # OpenAI 兼容
+    base_url_anthropic: "https://api.deepseek.com/anthropic"  # Anthropic 兼容
+    api_key: "${DEEPSEEK_API_KEY}"
+    model: "deepseek-v4-pro"
+    timeout: 120s
+```
+
+这样配置后，无论客户端使用 OpenAI SDK 还是 Anthropic SDK，都可以无缝接入。
 
 ## 环境要求
 
@@ -73,7 +203,7 @@ go build -o proxy-llm.exe .\cmd\server
 
 ### `models`
 
-列表项示例字段：`name`（客户端请求的模型别名）、`base_url`、`api_key`（支持 `${ENV_VAR}` 占位）、`model`（发给上游的真实模型名）、`timeout`、`max_retries`。可选 llama.cpp 相关：`llama_api`、`llama_api_key`、`llama_model`。
+列表项示例字段：`name`（客户端请求的模型别名）、`base_url`（OpenAI 兼容端点）、`base_url_anthropic`（Anthropic 兼容端点，可选）、`api_key`（支持 `${ENV_VAR}` 占位）、`model`（发给上游的真实模型名）、`timeout`、`max_retries`。可选 llama.cpp 相关：`llama_api`、`llama_api_key`、`llama_model`。
 
 ### `storage`
 

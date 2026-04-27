@@ -195,12 +195,18 @@ func (p *Proxy) handleRequest(endpoint string) http.HandlerFunc {
 		apiKey := p.getAPIKey(modelName)
 		requestLogger.Debug("API key retrieved for model: %s", modelName)
 
-		// Translate model name from proxy name to actual llama.cpp model name
-		requestLogger.Debug("Translating model name from %s to %s", modelName, p.config.Models[0].ModelName)
-		p.translateModelNameInBody(reqBody)
-		// Re-marshal body with translated model name
-		body, _ = json.Marshal(reqBody)
-		requestLogger.Debug("Translated model name in request body")
+		// Translate model name from proxy name to actual model name
+		if p.translateModelNameInBody(reqBody) {
+			// Re-marshal body with translated model name
+			translatedBody, marshalErr := json.Marshal(reqBody)
+			if marshalErr != nil {
+				requestLogger.Error("Failed to re-marshal body after model translation: %v", marshalErr)
+				http.Error(w, "Internal server error", http.StatusInternalServerError)
+				return
+			}
+			body = translatedBody
+			requestLogger.Debug("Translated model name in request body")
+		}
 
 		// Create proxy request
 		requestLogger.Debug("Creating proxy request...")
@@ -376,7 +382,22 @@ func (p *Proxy) handleAnthropicMessages() http.HandlerFunc {
 			modelName = model
 		}
 
-		// Convert Anthropic messages payload into OpenAI chat/completions payload.
+		// If the model has a dedicated Anthropic base URL, forward the raw request
+		// directly without converting to OpenAI format.
+		if anthropicBase := p.getModelBaseURLAnthropic(modelName); anthropicBase != "" {
+			isStream := false
+			if stream, ok := anthropicReq["stream"].(bool); ok {
+				isStream = stream
+			}
+			if isStream && p.config.Proxy.EnableStream {
+				p.handleAnthropicPassthroughStream(w, r, body, modelName, anthropicBase, start, requestLogger)
+				return
+			}
+			p.handleAnthropicPassthrough(w, r, body, modelName, anthropicBase, start, requestLogger)
+			return
+		}
+
+		// Fallback: convert Anthropic messages payload into OpenAI chat/completions payload.
 		chatReq := map[string]interface{}{
 			"model":  modelName,
 			"stream": false,
@@ -555,11 +576,11 @@ func (p *Proxy) handleAnthropicMessages() http.HandlerFunc {
 		}
 
 		anthropicResp := map[string]interface{}{
-			"id":    "msg_" + nextUniqueID(),
-			"type":  "message",
-			"role":  "assistant",
-			"model": modelName,
-			"content": contentBlocks,
+			"id":            "msg_" + nextUniqueID(),
+			"type":          "message",
+			"role":          "assistant",
+			"model":         modelName,
+			"content":       contentBlocks,
 			"stop_reason":   stopReason,
 			"stop_sequence": nil,
 			"usage":         usage,
@@ -987,6 +1008,189 @@ func (p *Proxy) handleAnthropicMessagesStream(w http.ResponseWriter, r *http.Req
 	p.logRequest(chatReq, modelName, "messages", start, resp.StatusCode, respBytes, true, "", usage, requestLogger)
 }
 
+// handleAnthropicPassthrough forwards a raw Anthropic request directly to an
+// Anthropic-compatible upstream endpoint without any protocol conversion.
+func (p *Proxy) handleAnthropicPassthrough(w http.ResponseWriter, r *http.Request, rawBody []byte, modelName, anthropicBase string, start time.Time, requestLogger *logger.Logger) {
+	targetURL := anthropicBase + "/messages"
+	proxyReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, targetURL, bytes.NewReader(rawBody))
+	if err != nil {
+		requestLogger.Error("Failed to create Anthropic passthrough request: %v", err)
+		http.Error(w, "Failed to create proxy request", http.StatusInternalServerError)
+		return
+	}
+	proxyReq.Header.Set("Authorization", "Bearer "+p.getAPIKey(modelName))
+	proxyReq.Header.Set("Content-Type", "application/json")
+	proxyReq.Header.Set("x-api-key", p.getAPIKey(modelName))
+
+	upstreamCallID := "up_" + nextUniqueID()
+	upstreamStart := time.Now()
+	retryCount := r.Header.Get("X-Stainless-Retry-Count")
+	requestLogger.Info(
+		"Upstream call start (anthropic passthrough): call_id=%s target=%s remote=%s retry_count=%s",
+		upstreamCallID, targetURL, r.RemoteAddr, retryCount,
+	)
+	if p.shouldLogUpstreamHTTP() {
+		p.logHTTPOutgoingUpstream(requestLogger, upstreamCallID, proxyReq, rawBody)
+	}
+
+	client := p.getHTTPClient(modelName)
+	resp, err := client.Do(proxyReq)
+	if err != nil {
+		if r.Context().Err() != nil {
+			requestLogger.Warn(
+				"Upstream call canceled (anthropic passthrough): call_id=%s reason=client_disconnected elapsed=%v err=%v",
+				upstreamCallID, time.Since(upstreamStart), r.Context().Err(),
+			)
+			return
+		}
+		requestLogger.Error(
+			"Upstream call failed (anthropic passthrough): call_id=%s elapsed=%v err=%v",
+			upstreamCallID, time.Since(upstreamStart), err,
+		)
+		p.logRequest(nil, modelName, "messages", start, 500, nil, false, err.Error(), nil, requestLogger)
+		http.Error(w, "Proxy error: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+	requestLogger.Info(
+		"Upstream call success (anthropic passthrough): call_id=%s status=%d elapsed=%v",
+		upstreamCallID, resp.StatusCode, time.Since(upstreamStart),
+	)
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		if r.Context().Err() != nil {
+			requestLogger.Warn("Client disconnected during anthropic passthrough body read: %v", r.Context().Err())
+			return
+		}
+		requestLogger.Error("Failed to read anthropic passthrough response: %v", err)
+		p.logRequest(nil, modelName, "messages", start, resp.StatusCode, nil, false, err.Error(), nil, requestLogger)
+		http.Error(w, "Failed to read response", http.StatusBadGateway)
+		return
+	}
+	if p.shouldLogUpstreamHTTP() {
+		p.logHTTPUpstreamResponseFull(requestLogger, upstreamCallID, resp, respBody)
+	}
+
+	var respParsed map[string]interface{}
+	json.Unmarshal(respBody, &respParsed)
+	tokensUsed := p.extractTokens(respParsed)
+	p.logRequest(nil, modelName, "messages", start, resp.StatusCode, respBody, false, "", tokensUsed, requestLogger)
+
+	w.Header().Set("Content-Type", resp.Header.Get("Content-Type"))
+	w.WriteHeader(resp.StatusCode)
+	w.Write(respBody)
+}
+
+// handleAnthropicPassthroughStream forwards a raw streaming Anthropic request
+// directly to an Anthropic-compatible upstream endpoint. SSE events are relayed
+// as-is without any format conversion.
+func (p *Proxy) handleAnthropicPassthroughStream(w http.ResponseWriter, r *http.Request, rawBody []byte, modelName, anthropicBase string, start time.Time, requestLogger *logger.Logger) {
+	targetURL := anthropicBase + "/messages"
+	proxyReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, targetURL, bytes.NewReader(rawBody))
+	if err != nil {
+		requestLogger.Error("Failed to create Anthropic passthrough stream request: %v", err)
+		http.Error(w, "Failed to create proxy request", http.StatusInternalServerError)
+		return
+	}
+	proxyReq.Header.Set("Authorization", "Bearer "+p.getAPIKey(modelName))
+	proxyReq.Header.Set("Content-Type", "application/json")
+	proxyReq.Header.Set("Accept", "text/event-stream")
+	proxyReq.Header.Set("x-api-key", p.getAPIKey(modelName))
+
+	upstreamCallID := "up_" + nextUniqueID()
+	upstreamStart := time.Now()
+	retryCount := r.Header.Get("X-Stainless-Retry-Count")
+	requestLogger.Info(
+		"Upstream call start (anthropic passthrough stream): call_id=%s target=%s remote=%s retry_count=%s",
+		upstreamCallID, targetURL, r.RemoteAddr, retryCount,
+	)
+	if p.shouldLogUpstreamHTTP() {
+		p.logHTTPOutgoingUpstream(requestLogger, upstreamCallID, proxyReq, rawBody)
+	}
+
+	client := p.getHTTPClient(modelName)
+	resp, err := client.Do(proxyReq)
+	if err != nil {
+		if r.Context().Err() != nil {
+			requestLogger.Warn(
+				"Upstream call canceled (anthropic passthrough stream): call_id=%s reason=client_disconnected elapsed=%v err=%v",
+				upstreamCallID, time.Since(upstreamStart), r.Context().Err(),
+			)
+			return
+		}
+		requestLogger.Error(
+			"Upstream call failed (anthropic passthrough stream): call_id=%s elapsed=%v err=%v",
+			upstreamCallID, time.Since(upstreamStart), err,
+		)
+		p.logRequest(nil, modelName, "messages", start, 500, nil, true, err.Error(), nil, requestLogger)
+		http.Error(w, "Proxy error: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+	requestLogger.Info(
+		"Upstream call success (anthropic passthrough stream): call_id=%s status=%d elapsed=%v",
+		upstreamCallID, resp.StatusCode, time.Since(upstreamStart),
+	)
+	if p.shouldLogUpstreamHTTP() {
+		p.logHTTPUpstreamResponseStreamMeta(requestLogger, upstreamCallID, resp)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		respBody, _ := io.ReadAll(resp.Body)
+		if p.shouldLogUpstreamHTTP() {
+			p.logHTTPUpstreamResponseFull(requestLogger, upstreamCallID, resp, respBody)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(resp.StatusCode)
+		w.Write(respBody)
+		return
+	}
+
+	// Relay SSE stream as-is.
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.WriteHeader(resp.StatusCode)
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "Streaming unsupported", http.StatusInternalServerError)
+		return
+	}
+
+	streamBytes := 0
+	chunkCount := 0
+	buf := make([]byte, 4096)
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		default:
+		}
+		n, readErr := resp.Body.Read(buf)
+		if n > 0 {
+			w.Write(buf[:n])
+			flusher.Flush()
+			chunkCount++
+			streamBytes += n
+		}
+		if readErr != nil {
+			if readErr == io.EOF {
+				requestLogger.Info("Anthropic passthrough stream completed: call_id=%s chunks=%d bytes=%d",
+					upstreamCallID, chunkCount, streamBytes)
+			} else {
+				requestLogger.Error("Anthropic passthrough stream error: call_id=%s err=%v chunks=%d bytes=%d",
+					upstreamCallID, readErr, chunkCount, streamBytes)
+			}
+			break
+		}
+	}
+
+	var anthropicReq map[string]interface{}
+	json.Unmarshal(rawBody, &anthropicReq)
+	p.logRequest(anthropicReq, modelName, "messages", start, resp.StatusCode, nil, true, "", nil, requestLogger)
+}
+
 // handleStreaming manages streaming responses
 func (p *Proxy) handleStreaming(w http.ResponseWriter, r *http.Request, proxyReq *http.Request, client *http.Client, reqBody map[string]interface{}, modelName string, start time.Time, endpoint string, requestLogger *logger.Logger, upstreamCallID string, upstreamStart time.Time, _ []byte) {
 	requestLogger.Info("=== Streaming mode initiated ===")
@@ -1143,6 +1347,17 @@ func (p *Proxy) getModelBaseURL(modelName string) string {
 	return p.config.Models[0].BaseURL
 }
 
+// getModelBaseURLAnthropic returns the Anthropic-compatible base URL for a model.
+// Returns empty string if not configured (caller should fall back to OpenAI conversion path).
+func (p *Proxy) getModelBaseURLAnthropic(modelName string) string {
+	for _, model := range p.config.Models {
+		if model.Name == modelName {
+			return model.BaseURLAnthropic
+		}
+	}
+	return p.config.Models[0].BaseURLAnthropic
+}
+
 // getAPIKey returns the API key for a model
 func (p *Proxy) getAPIKey(modelName string) string {
 	for _, model := range p.config.Models {
@@ -1163,12 +1378,23 @@ func (p *Proxy) getModelByProxyName(modelName string) *config.ModelConfig {
 	return nil
 }
 
-// translateModelNameInBody updates the model name in request body from proxy name to target model name
-func (p *Proxy) translateModelNameInBody(reqBody map[string]interface{}) {
-	modelConfig := p.getModelByProxyName(reqBody["model"].(string))
-	if modelConfig != nil {
-		reqBody["model"] = modelConfig.ModelName
+// translateModelNameInBody updates the model name in request body from proxy name to target model name.
+// Returns false if the model field is missing or not a string.
+func (p *Proxy) translateModelNameInBody(reqBody map[string]interface{}) bool {
+	modelRaw, exists := reqBody["model"]
+	if !exists {
+		return false
 	}
+	modelName, ok := modelRaw.(string)
+	if !ok {
+		return false
+	}
+	modelConfig := p.getModelByProxyName(modelName)
+	if modelConfig == nil {
+		return false
+	}
+	reqBody["model"] = modelConfig.ModelName
+	return true
 }
 
 // logRequest logs a request/response pair
@@ -1467,12 +1693,36 @@ func (p *Proxy) createAuthMiddleware() func(http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-// createCORSMiddleware creates CORS middleware
+// createCORSMiddleware creates CORS middleware using configured AllowedOrigins.
 func (p *Proxy) createCORSMiddleware(next http.Handler) http.Handler {
+	allowedOrigins := p.config.Proxy.AllowedOrigins
+	// Fallback: if no origins configured, allow all.
+	if len(allowedOrigins) == 0 {
+		allowedOrigins = []string{"*"}
+	}
+
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
+		origin := r.Header.Get("Origin")
+		allowOrigin := ""
+		for _, ao := range allowedOrigins {
+			if ao == "*" {
+				allowOrigin = "*"
+				break
+			}
+			if ao == origin {
+				allowOrigin = origin
+				break
+			}
+		}
+		if allowOrigin == "" && len(allowedOrigins) > 0 {
+			// No matching origin; still set the first one to avoid breaking simple clients
+			// but this effectively denies cross-origin requests from unmatched origins.
+			allowOrigin = allowedOrigins[0]
+		}
+
+		w.Header().Set("Access-Control-Allow-Origin", allowOrigin)
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-API-Key, X-Session-ID, X-Stainless-Retry-Count")
 
 		if r.Method == "OPTIONS" {
 			w.WriteHeader(http.StatusOK)

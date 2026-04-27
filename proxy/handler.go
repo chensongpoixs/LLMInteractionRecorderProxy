@@ -19,10 +19,10 @@ import (
 
 // Handler provides HTTP handlers for the proxy
 type Handler struct {
-	config    *config.Config
+	config        *config.Config
 	storageLogger *storage.Logger
-	metrics   *Metrics
-	appLogger *logger.Logger
+	metrics       *Metrics
+	appLogger     *logger.Logger
 
 	requestCount   atomic.Int64
 	errorCount     atomic.Int64
@@ -60,29 +60,29 @@ type usageRecentItem struct {
 }
 
 type usageSummaryResponse struct {
-	Days            int               `json:"days"`
-	GeneratedAt     string            `json:"generated_at"`
-	TotalRequests   int               `json:"total_requests"`
-	SuccessRequests int               `json:"success_requests"`
-	SuccessRate     float64           `json:"success_rate"`
-	AvgLatencyMS    int64             `json:"avg_latency_ms"`
-	PromptTokens    int64             `json:"prompt_tokens"`
-	CompletionTokens int64            `json:"completion_tokens"`
-	TotalTokens     int64             `json:"total_tokens"`
-	EstimatedCostUSD float64          `json:"estimated_cost_usd"`
-	Daily           []usageDailyPoint `json:"daily"`
-	ByModel         []usageModelPoint `json:"by_model"`
-	Recent          []usageRecentItem `json:"recent"`
+	Days             int               `json:"days"`
+	GeneratedAt      string            `json:"generated_at"`
+	TotalRequests    int               `json:"total_requests"`
+	SuccessRequests  int               `json:"success_requests"`
+	SuccessRate      float64           `json:"success_rate"`
+	AvgLatencyMS     int64             `json:"avg_latency_ms"`
+	PromptTokens     int64             `json:"prompt_tokens"`
+	CompletionTokens int64             `json:"completion_tokens"`
+	TotalTokens      int64             `json:"total_tokens"`
+	EstimatedCostUSD float64           `json:"estimated_cost_usd"`
+	Daily            []usageDailyPoint `json:"daily"`
+	ByModel          []usageModelPoint `json:"by_model"`
+	Recent           []usageRecentItem `json:"recent"`
 }
 
 // NewHandler creates a new handler instance
 func NewHandler(cfg *config.Config, storageLogger *storage.Logger, metrics *Metrics, appLogger *logger.Logger) *Handler {
 	appLogger.Info("Initializing HTTP handler...")
 	return &Handler{
-		config:    cfg,
+		config:        cfg,
 		storageLogger: storageLogger,
-		metrics:   metrics,
-		appLogger: appLogger,
+		metrics:       metrics,
+		appLogger:     appLogger,
 	}
 }
 

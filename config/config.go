@@ -1,21 +1,27 @@
 package config
 
 import (
+	"fmt"
 	"os"
-	"sync"
+	"regexp"
+	"strconv"
 	"time"
 
 	"gopkg.in/yaml.v3"
 )
 
+// envVarPattern matches ${VAR_NAME} placeholders in config values.
+var envVarPattern = regexp.MustCompile(`\$\{([^}]+)\}`)
+
 // ModelConfig defines a single LLM provider configuration
 type ModelConfig struct {
-	Name       string        `yaml:"name"`
-	BaseURL    string        `yaml:"base_url"`
-	APIKey     string        `yaml:"api_key"`
-	ModelName  string        `yaml:"model"`
-	Timeout    time.Duration `yaml:"timeout"`
-	MaxRetries int           `yaml:"max_retries"`
+	Name             string        `yaml:"name"`
+	BaseURL          string        `yaml:"base_url"`           // OpenAI-compatible base URL (e.g. https://api.deepseek.com)
+	BaseURLAnthropic string        `yaml:"base_url_anthropic"` // Anthropic-compatible base URL (e.g. https://api.deepseek.com/anthropic)
+	APIKey           string        `yaml:"api_key"`
+	ModelName        string        `yaml:"model"`
+	Timeout          time.Duration `yaml:"timeout"`
+	MaxRetries       int           `yaml:"max_retries"`
 	// Llama.cpp specific configuration
 	LlamaAPI    string `yaml:"llama_api"`     // llama.cpp API endpoint (e.g., "/v1/api/chat")
 	LlamaAPIKey string `yaml:"llama_api_key"` // llama.cpp API key if required
@@ -97,37 +103,67 @@ type MonitoringConfig struct {
 	MetricsPath   string `yaml:"metrics_path"`
 }
 
-var (
-	instance *Config
-	once     sync.Once
-)
+// expandEnvVars recursively walks a value and replaces ${VAR} placeholders with
+// environment variable values.
+func expandEnvVars(v interface{}) interface{} {
+	switch val := v.(type) {
+	case string:
+		return envVarPattern.ReplaceAllStringFunc(val, func(match string) string {
+			// match looks like ${VAR_NAME}, extract the name inside braces.
+			varName := match[2 : len(match)-1]
+			return os.Getenv(varName)
+		})
+	case map[string]interface{}:
+		for k, vv := range val {
+			val[k] = expandEnvVars(vv)
+		}
+		return val
+	case []interface{}:
+		for i, item := range val {
+			val[i] = expandEnvVars(item)
+		}
+		return val
+	default:
+		return v
+	}
+}
 
-// Load reads configuration from file and environment variables
+// Load reads configuration from file and applies environment variable overrides.
 func Load(path string) (*Config, error) {
-	var err error
-	once.Do(func() {
-		data, e := os.ReadFile(path)
-		if e != nil {
-			err = e
-			return
-		}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read config file: %w", err)
+	}
 
-		instance = &Config{}
-		if e = yaml.Unmarshal(data, instance); e != nil {
-			err = e
-			return
-		}
+	// Unmarshal into a generic map first so we can expand env vars in all string values.
+	var raw map[string]interface{}
+	if err := yaml.Unmarshal(data, &raw); err != nil {
+		return nil, fmt.Errorf("failed to parse config: %w", err)
+	}
+	expanded := expandEnvVars(raw).(map[string]interface{})
 
-		// Allow environment variable overrides
-		if v := os.Getenv("PROXY_PORT"); v != "" {
-			instance.Server.Port = 8080 // fallback
-		}
-		if v := os.Getenv("PROXY_STORAGE_DIR"); v != "" {
-			instance.Storage.Directory = v
-		}
-	})
+	// Re-marshal the expanded map back to YAML, then unmarshal into Config struct.
+	expandedBytes, err := yaml.Marshal(expanded)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal expanded config: %w", err)
+	}
 
-	return instance, err
+	cfg := &Config{}
+	if err := yaml.Unmarshal(expandedBytes, cfg); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal config: %w", err)
+	}
+
+	// Allow environment variable overrides
+	if v := os.Getenv("PROXY_PORT"); v != "" {
+		if port, err := strconv.Atoi(v); err == nil {
+			cfg.Server.Port = port
+		}
+	}
+	if v := os.Getenv("PROXY_STORAGE_DIR"); v != "" {
+		cfg.Storage.Directory = v
+	}
+
+	return cfg, nil
 }
 
 // DefaultConfig returns a sensible default configuration

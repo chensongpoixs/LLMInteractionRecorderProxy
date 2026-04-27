@@ -39,15 +39,15 @@ func (l Level) String() string {
 
 // Config holds logger configuration
 type Config struct {
-	Level       Level   `yaml:"level"`
-	File        string  `yaml:"file"`
-	MaxSizeMB   int     `yaml:"max_size_mb"`
-	MaxBackups  int     `yaml:"max_backups"`
-	MaxAgeDays  int     `yaml:"max_age_days"`
-	Compress    bool    `yaml:"compress"`
-	Console     bool    `yaml:"console"`
-	RequestLog  bool    `yaml:"request_log"`
-	RequestBody bool    `yaml:"request_body"`
+	Level        Level  `yaml:"level"`
+	File         string `yaml:"file"`
+	MaxSizeMB    int    `yaml:"max_size_mb"`
+	MaxBackups   int    `yaml:"max_backups"`
+	MaxAgeDays   int    `yaml:"max_age_days"`
+	Compress     bool   `yaml:"compress"`
+	Console      bool   `yaml:"console"`
+	RequestLog   bool   `yaml:"request_log"`
+	RequestBody  bool   `yaml:"request_body"`
 	ResponseBody bool   `yaml:"response_body"`
 }
 
@@ -88,8 +88,8 @@ func New(cfg *Config) (*Logger, error) {
 	}
 
 	l := &Logger{
-		level:    cfg.Level,
-		config:   cfg,
+		level:     cfg.Level,
+		config:    cfg,
 		startTime: time.Now(),
 	}
 
@@ -211,13 +211,13 @@ func (l *Logger) WithRequestID(id string) *Logger {
 	defer l.mu.Unlock()
 
 	newLogger := &Logger{
-		level:    l.level,
-		file:     l.file,
-		console:  l.console,
+		level:      l.level,
+		file:       l.file,
+		console:    l.console,
 		fileLogger: l.fileLogger,
-		requestID: id,
-		config:   l.config,
-		startTime: l.startTime,
+		requestID:  id,
+		config:     l.config,
+		startTime:  l.startTime,
 	}
 	return newLogger
 }
