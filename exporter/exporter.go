@@ -46,7 +46,7 @@ type MessageEntry struct {
 	Reasoning string `json:"reasoning,omitempty"`
 }
 
-var systemReminderRE = regexp.MustCompile(`(?s)<system-reminder>.*?</system-reminder>`)
+var SystemReminderRE = regexp.MustCompile(`(?s)<system-reminder>.*?</system-reminder>`)
 
 // ExportDay aggregates all request logs under storageDir/YYYYMMDD into one JSONL file
 // in the improved reasoning format.
@@ -257,8 +257,8 @@ func buildRow(rec *storage.RequestLog, streamIndex map[string][]string) (Dataset
 	if rec.RequestBody == nil {
 		return DatasetRow{}, false
 	}
-	problem := extractProblem(rec.RequestBody, rec.SystemPrompt)
-	problem = strings.TrimSpace(systemReminderRE.ReplaceAllString(problem, ""))
+	problem := ExtractProblem(rec.RequestBody, rec.SystemPrompt)
+	problem = strings.TrimSpace(SystemReminderRE.ReplaceAllString(problem, ""))
 	problem = strings.TrimSpace(problem)
 	if problem == "" {
 		return DatasetRow{}, false
@@ -319,8 +319,8 @@ func buildMessagesRow(rec *storage.RequestLog) (MessagesRow, bool) {
 		return MessagesRow{}, false
 	}
 
-	userContent := extractProblem(rec.RequestBody, rec.SystemPrompt)
-	userContent = strings.TrimSpace(systemReminderRE.ReplaceAllString(userContent, ""))
+	userContent := ExtractProblem(rec.RequestBody, rec.SystemPrompt)
+	userContent = strings.TrimSpace(SystemReminderRE.ReplaceAllString(userContent, ""))
 	userContent = strings.TrimSpace(userContent)
 	if userContent == "" {
 		return MessagesRow{}, false
@@ -348,7 +348,7 @@ func buildMessagesRow(rec *storage.RequestLog) (MessagesRow, bool) {
 	return MessagesRow{Messages: messages}, true
 }
 
-func extractProblem(req map[string]interface{}, systemPrompt string) string {
+func ExtractProblem(req map[string]interface{}, systemPrompt string) string {
 	if msgs, ok := req["messages"].([]interface{}); ok {
 		return joinUserMessages(msgs, systemPrompt)
 	}
@@ -793,8 +793,8 @@ func ExportDatasetDay(storageDir string, day time.Time, outputDir string) (*Data
 				continue
 			}
 
-			problem := extractProblem(rec.RequestBody, rec.SystemPrompt)
-			problem = strings.TrimSpace(systemReminderRE.ReplaceAllString(problem, ""))
+			problem := ExtractProblem(rec.RequestBody, rec.SystemPrompt)
+			problem = strings.TrimSpace(SystemReminderRE.ReplaceAllString(problem, ""))
 			problem = strings.TrimSpace(problem)
 			if len(problem) < minPromptLength {
 				stats.FilteredOut++
@@ -851,7 +851,7 @@ func ExportDatasetDay(storageDir string, day time.Time, outputDir string) (*Data
 		}
 
 		// ── prompts/ ──
-		lang := detectLanguage(vr.prompt)
+		lang := DetectLanguage(vr.prompt)
 		category := inferCategory(vr.prompt, vr.solution, vr.thinking)
 		promptTokens := 0
 		if rec.TokensUsed != nil {
@@ -982,7 +982,7 @@ func ExportDatasetDay(storageDir string, day time.Time, outputDir string) (*Data
 	return stats, nil
 }
 
-func detectLanguage(text string) string {
+func DetectLanguage(text string) string {
 	cjk := 0
 	ascii := 0
 	total := 0

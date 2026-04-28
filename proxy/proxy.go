@@ -95,6 +95,8 @@ func New(cfg *config.Config, storageLogger *storage.Logger, metrics *Metrics, ap
 	mux.HandleFunc("/usage", proxy.handleUsageDashboard)
 	mux.HandleFunc("/api/usage/summary", proxy.handler.HandleUsageSummary)
 	mux.HandleFunc("/api/usage/stream", proxy.handler.HandleUsageStream)
+	mux.HandleFunc("/api/prompts/dates", proxy.handler.HandlePromptDates)
+	mux.HandleFunc("/api/prompts", proxy.handler.HandlePromptList)
 
 	// Export endpoints
 	mux.HandleFunc("/api/export/dates", proxy.handleExportDates)
@@ -1275,7 +1277,11 @@ func (p *Proxy) handleAnthropicPassthroughStream(w http.ResponseWriter, r *http.
 
 	streamBytes := 0
 	chunkCount := 0
-	aggregatedStreamBytes := make([]byte, 0, 4096)
+	aggregatedContent := ""
+	aggregatedReasoning := ""
+
+	// SSE line buffer for partial reads across Read calls
+	var sseBuf []byte
 	buf := make([]byte, 4096)
 	for {
 		select {
@@ -1286,15 +1292,67 @@ func (p *Proxy) handleAnthropicPassthroughStream(w http.ResponseWriter, r *http.
 		n, readErr := resp.Body.Read(buf)
 		if n > 0 {
 			w.Write(buf[:n])
-			aggregatedStreamBytes = append(aggregatedStreamBytes, buf[:n]...)
 			flusher.Flush()
 			chunkCount++
 			streamBytes += n
+
+			// Parse SSE events to accumulate content and reasoning
+			sseBuf = append(sseBuf, buf[:n]...)
+			for {
+				idx := bytes.IndexByte(sseBuf, '\n')
+				if idx < 0 {
+					break
+				}
+				line := bytes.TrimSpace(sseBuf[:idx])
+				sseBuf = sseBuf[idx+1:]
+
+				if !bytes.HasPrefix(line, []byte("data:")) {
+					continue
+				}
+				data := bytes.TrimSpace(line[5:])
+				if len(data) == 0 || data[0] != '{' {
+					continue
+				}
+				idxEnd := bytes.LastIndexByte(data, '}')
+				if idxEnd < 0 {
+					continue
+				}
+				data = data[:idxEnd+1]
+
+				// Try Anthropic format: {"type":"content_block_delta","delta":{"type":"text_delta","text":"..."}}
+				var evt map[string]interface{}
+				if json.Unmarshal(data, &evt) != nil {
+					continue
+				}
+				delta, _ := evt["delta"].(map[string]interface{})
+				if delta == nil {
+					// Try OpenAI format: {"choices":[{"delta":{"content":"..."}}]}
+					if choices, _ := evt["choices"].([]interface{}); len(choices) > 0 {
+						if c0, ok := choices[0].(map[string]interface{}); ok {
+							delta, _ = c0["delta"].(map[string]interface{})
+						}
+					}
+				}
+				if delta != nil {
+					if t, ok := delta["text"].(string); ok {
+						aggregatedContent += t
+					}
+					if t, ok := delta["thinking"].(string); ok {
+						aggregatedReasoning += t
+					}
+					if c, ok := delta["content"].(string); ok {
+						aggregatedContent += c
+					}
+					if rc, ok := delta["reasoning_content"].(string); ok {
+						aggregatedReasoning += rc
+					}
+				}
+			}
 		}
 		if readErr != nil {
 			if readErr == io.EOF {
-				requestLogger.Info("Anthropic passthrough stream completed: call_id=%s chunks=%d bytes=%d",
-					upstreamCallID, chunkCount, streamBytes)
+				requestLogger.Info("Anthropic passthrough stream completed: call_id=%s chunks=%d bytes=%d content_len=%d reasoning_len=%d",
+					upstreamCallID, chunkCount, streamBytes, len(aggregatedContent), len(aggregatedReasoning))
 			} else {
 				requestLogger.Error("Anthropic passthrough stream error: call_id=%s err=%v chunks=%d bytes=%d",
 					upstreamCallID, readErr, chunkCount, streamBytes)
@@ -1304,10 +1362,42 @@ func (p *Proxy) handleAnthropicPassthroughStream(w http.ResponseWriter, r *http.
 	}
 
 	var anthropicReq map[string]interface{}
-	// aggregatedStreamBytes already declared above	var anthropicReq map[string]interface{}
 	json.Unmarshal(rawBody, &anthropicReq)
-	// Save with aggregated response body for dataset quality
-	p.logRequest(anthropicReq, modelName, "messages", start, resp.StatusCode, nil, true, "", nil, requestLogger)
+
+	// Build aggregated response from accumulated content/reasoning
+	var aggregatedResponse map[string]interface{}
+	if aggregatedContent != "" || aggregatedReasoning != "" {
+		aggregatedResponse = map[string]interface{}{
+			"choices": []interface{}{
+				map[string]interface{}{
+					"message": map[string]interface{}{
+						"content":           aggregatedContent,
+						"reasoning_content": aggregatedReasoning,
+					},
+				},
+			},
+		}
+	}
+
+	sessionID := r.Header.Get("X-Session-ID")
+	if sessionID == "" {
+		sessionID = fmt.Sprintf("session_%s_stream", modelName)
+	}
+	reqLog := &storage.RequestLog{
+		ID:                 "req_" + nextUniqueID(),
+		Timestamp:          time.Now(),
+		SessionID:          sessionID,
+		Endpoint:           "messages",
+		Method:             "POST",
+		Model:              modelName,
+		Provider:           modelName,
+		RequestBody:        anthropicReq,
+		StatusCode:         resp.StatusCode,
+		Stream:             true,
+		Duration:           time.Since(start).String(),
+		AggregatedResponse: aggregatedResponse,
+	}
+	p.logger.SaveRequest(reqLog)
 }
 
 // handleStreaming manages streaming responses

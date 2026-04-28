@@ -35,3 +35,4 @@ Thumbs.db
 /exports/20260428/prompts/*.jsonl
 /exports/20260428/responses/*.jsonl
 /exports/20260428/revisions/*.jsonl
+/huggingface_repo

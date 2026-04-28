@@ -226,6 +226,10 @@ func (l *Logger) ReadLog(filePath string) ([]json.RawMessage, error) {
 	var entries []json.RawMessage
 	scanner := bufio.NewScanner(bytes.NewReader(data))
 	scanner.Split(bufio.ScanLines)
+	// Set a larger buffer to handle long lines (default 64KB max is too small
+	// for multi-turn conversation logs that can exceed 600KB per line).
+	buf := make([]byte, 0, 128*1024)
+	scanner.Buffer(buf, 2*1024*1024)
 	for scanner.Scan() {
 		line := bytes.TrimSpace(scanner.Bytes())
 		if len(line) > 0 {
