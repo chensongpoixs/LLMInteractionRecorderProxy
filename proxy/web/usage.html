@@ -436,8 +436,22 @@
     <!-- ============ EXPORT TAB ============ -->
     <template v-if="activeTab === 'export'">
       <div class="export-actions">
-        <span style="font-size:13px;color:var(--text-secondary);">选择日期后点击"导出"，可下载单日 JSONL 数据集</span>
-        <button class="btn-sm" @click="loadExportDates" style="margin-left:auto;">
+        <span style="font-size:13px;color:var(--text-secondary);">格式:</span>
+        <select v-model="exportFormat" style="background:var(--card);color:var(--text);border:1px solid var(--line);padding:4px 8px;border-radius:4px;font-size:12px;">
+          <option value="reasoning">推理格式 (problem/thinking/solution)</option>
+          <option value="messages">OpenAI 微调格式 (messages)</option>
+          <option value="dataset">工业标准 (prompts/responses/revisions/feedback)</option>
+        </select>
+        <span style="font-size:13px;color:var(--text-secondary);margin-left:12px;">选择日期后点击"导出"</span>
+        <button class="btn-sm" @click="uploadToModelScope" :disabled="uploadingToMS" style="margin-left:auto; background: var(--accent-bg); color: var(--accent); border-color: var(--accent);">
+          <span v-if="uploadingToMS" class="spin" style="width:12px;height:12px;"></span>
+          {{ uploadingToMS ? '推送中...' : '推送 ModelScope' }}
+        </button>
+        <button class="btn-sm" @click="uploadToHuggingFace" :disabled="uploadingToHF" style="background: var(--orange-bg); color: var(--orange); border-color: var(--orange);">
+          <span v-if="uploadingToHF" class="spin" style="width:12px;height:12px;"></span>
+          {{ uploadingToHF ? '推送中...' : '推送 HuggingFace' }}
+        </button>
+        <button class="btn-sm" @click="loadExportDates">
           <span v-if="exportLoading" class="spin" style="width:12px;height:12px;"></span>
           刷新列表
         </button>
@@ -511,7 +525,9 @@
             avg_latency_ms: 0, generated_at: "", daily: [], by_model: [], recent: [],
           },
           // Export tab state
+          exportFormat: 'reasoning',
           exportDates: [], exportLoading: false,
+          uploadingToMS: false, uploadingToHF: false,
           toast: { show: false, message: '', type: 'success' },
         };
       },
@@ -599,7 +615,7 @@
         async triggerExport(d) {
           d.exporting = true;
           try {
-            const res = await fetch('/api/export/day?date=' + d.date, { method: 'POST', cache: "no-store" });
+            const res = await fetch('/api/export/day?date=' + d.date + '&format=' + this.exportFormat, { method: 'POST', cache: "no-store" });
             const data = await res.json();
             if (!res.ok) throw new Error(data.error || 'Export failed');
             d.exported = true;
@@ -612,6 +628,34 @@
         },
         downloadExport(fileName) {
           window.open('/api/export/download?file=' + encodeURIComponent(fileName), '_blank');
+        },
+        async uploadToModelScope() {
+          this.uploadingToMS = true;
+          try {
+            const res = await fetch('/api/modelscope/upload', { method: 'POST', cache: "no-store" });
+            const data = await res.json();
+            if (res.ok) {
+              this.showToast('ModelScope 上传已触发，后台执行中...', 'success');
+            } else {
+              this.showToast('上传失败: ' + (data.message || data.error || res.statusText), 'error');
+            }
+          } catch (err) {
+            this.showToast('上传请求失败: ' + err.message, 'error');
+          } finally { this.uploadingToMS = false; }
+        },
+        async uploadToHuggingFace() {
+          this.uploadingToHF = true;
+          try {
+            const res = await fetch('/api/huggingface/upload', { method: 'POST', cache: "no-store" });
+            const data = await res.json();
+            if (res.ok) {
+              this.showToast('HuggingFace 上传已触发，后台执行中...', 'success');
+            } else {
+              this.showToast('上传失败: ' + (data.message || data.error || res.statusText), 'error');
+            }
+          } catch (err) {
+            this.showToast('上传请求失败: ' + err.message, 'error');
+          } finally { this.uploadingToHF = false; }
         },
       },
       mounted() {

@@ -24,3 +24,14 @@ Thumbs.db
 /logs/app.log
 /config.yaml
 /config.yaml
+/modelscope_repo
+/exports/20260427/feedback
+/exports/20260427/*.csv
+/exports/20260427/prompts/*.jsonl
+/exports/20260427/responses/*.jsonl
+/exports/20260427/revisions/*.jsonl
+/exports/20260428/feedback/*.jsonl
+/exports/20260428/*.csv
+/exports/20260428/prompts/*.jsonl
+/exports/20260428/responses/*.jsonl
+/exports/20260428/revisions/*.jsonl

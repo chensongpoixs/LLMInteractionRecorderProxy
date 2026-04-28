@@ -112,6 +112,46 @@ daily_export:
   enable: true
   output_dir: "./exports"
   file_prefix: "Opus-4.6-Reasoning-3000x-filtered-"
+  export_format: "dataset"    # "reasoning" / "messages" / "dataset" (prompts/responses/revisions/feedback)
   run_hour: 0
   run_minute: 5
   timezone: "Local"
+
+
+
+# =============================================================================
+# ModelScope 数据集自动上传配置
+# =============================================================================
+# 每天凌晨导出完成后，通过 Git 将数据自动推送至 ModelScope 数据集仓库。
+# 前提条件：
+#   1. 在 https://modelscope.cn 上创建数据集仓库
+#   2. 获取 Git 访问令牌：https://modelscope.cn/my/myaccesstoken
+#   3. repo_url 格式：https://oauth2:TOKEN@www.modelscope.cn/datasets/USER/REPO.git
+modelscope:
+  enable: false
+  repo_url: "https://oauth2:${MODELSCOPE_GIT_TOKEN}@www.modelscope.cn/datasets/chensongpoixs/llm_interaction_corpus.git"
+  repo_dir: "./modelscope_repo"
+  git_user: "chensongpoixs"
+  git_email: "chensongpoixs@users.noreply.modelscope.cn"
+  data_subdir: "data"
+  upload_delay: 10
+  git_branch: "master"
+
+# =============================================================================
+# HuggingFace 数据集自动上传配置
+# =============================================================================
+# 每天凌晨导出完成后，通过 Git 将数据自动推送至 HuggingFace 数据集仓库。
+# 前提条件：
+#   1. 在 https://huggingface.co 上创建数据集仓库
+#   2. 获取 HuggingFace Access Token：https://huggingface.co/settings/tokens
+#   3. repo_url 格式：https://USER:TOKEN@huggingface.co/datasets/USER/REPO.git
+huggingface:
+  enable: false
+  repo_url: "https://${HF_USERNAME}:${HF_TOKEN}@huggingface.co/datasets/${HF_USERNAME}/llm_interaction_corpus.git"
+  repo_dir: "./huggingface_repo"
+  git_user: "${HF_USERNAME}"
+  git_email: "${HF_EMAIL}"
+  data_subdir: "data"
+  upload_delay: 15
+  git_branch: "main"
+

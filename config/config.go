@@ -68,10 +68,22 @@ type DailyExportConfig struct {
 	Enable       bool   `yaml:"enable"`
 	OutputDir    string `yaml:"output_dir"`
 	FilePrefix   string `yaml:"file_prefix"`
-	ExportFormat string `yaml:"export_format"` // "reasoning" (default) or "messages" (OpenAI fine-tuning format)
+	ExportFormat string `yaml:"export_format"` // "reasoning" (default), "messages" (OpenAI fine-tuning), or "dataset" (prompts/responses/revisions/feedback)
 	RunHour      int    `yaml:"run_hour"`      // 0–23, in Timezone
 	RunMinute    int    `yaml:"run_minute"`    // 0–59, in Timezone
 	Timezone     string `yaml:"timezone"`      // e.g. "Local", "Asia/Shanghai" (empty = Local)
+}
+
+// DatasetRepoConfig controls automated daily upload to a dataset repository (ModelScope / HuggingFace) via Git.
+type DatasetRepoConfig struct {
+	Enable      bool   `yaml:"enable"`
+	RepoURL     string `yaml:"repo_url"`     // Git remote URL (should include token for push)
+	RepoDir     string `yaml:"repo_dir"`     // Local clone directory
+	GitUser     string `yaml:"git_user"`     // Git commit author name
+	GitEmail    string `yaml:"git_email"`    // Git commit author email
+	DataSubdir  string `yaml:"data_subdir"`  // Path within repo to place exported files (default: "data")
+	UploadDelay int    `yaml:"upload_delay"` // Seconds to wait after export before uploading (default: 10)
+	GitBranch   string `yaml:"git_branch"`   // Remote branch to push to (default: "master" for ModelScope, "main" for HF)
 }
 
 // Config is the root configuration structure
@@ -83,6 +95,8 @@ type Config struct {
 	Monitoring  MonitoringConfig  `yaml:"monitoring"`
 	Logging     LoggingConfig     `yaml:"logging"`
 	DailyExport DailyExportConfig `yaml:"daily_export"`
+	ModelScope  DatasetRepoConfig `yaml:"modelscope"`
+	HuggingFace DatasetRepoConfig `yaml:"huggingface"`
 }
 
 // ProxyConfig defines proxy behavior
@@ -219,6 +233,20 @@ func DefaultConfig() *Config {
 			RunHour:      0,
 			RunMinute:    5,
 			Timezone:     "Local",
+		},
+		ModelScope: DatasetRepoConfig{
+			Enable:      false,
+			RepoDir:     "./modelscope_repo",
+			DataSubdir:  "data",
+			UploadDelay: 10,
+			GitBranch:   "master",
+		},
+		HuggingFace: DatasetRepoConfig{
+			Enable:      false,
+			RepoDir:     "./huggingface_repo",
+			DataSubdir:  "data",
+			UploadDelay: 10,
+			GitBranch:   "main",
 		},
 	}
 }

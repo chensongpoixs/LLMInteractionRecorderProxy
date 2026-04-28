@@ -20,6 +20,7 @@ import (
 	"proxy-llm/exporter"
 	"proxy-llm/logger"
 	"proxy-llm/storage"
+	"proxy-llm/uploader"
 )
 
 // idSeq is combined with time.Now().UnixNano() so req/up IDs stay unique when the clock
@@ -99,6 +100,10 @@ func New(cfg *config.Config, storageLogger *storage.Logger, metrics *Metrics, ap
 	mux.HandleFunc("/api/export/dates", proxy.handleExportDates)
 	mux.HandleFunc("/api/export/day", proxy.handleExportDay)
 	mux.HandleFunc("/api/export/download", proxy.handleExportDownload)
+
+	// ModelScope / HuggingFace upload endpoints
+	mux.HandleFunc("/api/modelscope/upload", proxy.handleModelScopeUpload)
+	mux.HandleFunc("/api/huggingface/upload", proxy.handleHuggingFaceUpload)
 
 	// Health check
 	if cfg.Monitoring.EnableHealth {
@@ -1963,19 +1968,45 @@ func (p *Proxy) handleExportDay(w http.ResponseWriter, r *http.Request) {
 		prefix = "dataset-"
 	}
 
-	outPath := filepath.Join(outDir, prefix+dateStr+".jsonl")
+	// Support format query param: ?format=reasoning|messages|dataset
+	format := strings.ToLower(r.URL.Query().Get("format"))
+	if format == "" {
+		format = strings.ToLower(p.config.DailyExport.ExportFormat)
+	}
 
 	p.exportMu.Lock()
-	p.appLogger.Info("Export triggered via API for date: %s -> %s", dateStr, outPath)
-	n, err := exporter.ExportDay(p.config.Storage.Directory, day, outPath)
-	p.exportMu.Unlock()
+	defer p.exportMu.Unlock()
 
-	if err != nil {
-		p.appLogger.Error("Export failed for %s: %v", dateStr, err)
+	var n int
+	var exportErr error
+	var outPath string
+
+	switch format {
+	case "dataset":
+		outPath = filepath.Join(outDir, dateStr)
+		p.appLogger.Info("Export triggered via API (dataset format) for date: %s -> %s", dateStr, outPath)
+		stats, err := exporter.ExportDatasetDay(p.config.Storage.Directory, day, outPath)
+		if err != nil {
+			exportErr = err
+		} else {
+			n = stats.Prompts
+		}
+	case "messages":
+		outPath = filepath.Join(outDir, prefix+dateStr+".jsonl")
+		p.appLogger.Info("Export triggered via API (messages format) for date: %s -> %s", dateStr, outPath)
+		n, exportErr = exporter.ExportMessagesDay(p.config.Storage.Directory, day, outPath)
+	default:
+		outPath = filepath.Join(outDir, prefix+dateStr+".jsonl")
+		p.appLogger.Info("Export triggered via API for date: %s -> %s", dateStr, outPath)
+		n, exportErr = exporter.ExportDay(p.config.Storage.Directory, day, outPath)
+	}
+
+	if exportErr != nil {
+		p.appLogger.Error("Export failed for %s: %v", dateStr, exportErr)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusInternalServerError)
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"error": err.Error(),
+			"error": exportErr.Error(),
 		})
 		return
 	}
@@ -1986,6 +2017,7 @@ func (p *Proxy) handleExportDay(w http.ResponseWriter, r *http.Request) {
 		"rows":         n,
 		"file":         filepath.Base(outPath),
 		"download_url": "/api/export/download?file=" + filepath.Base(outPath),
+		"format":       format,
 	})
 }
 
@@ -2020,6 +2052,54 @@ func (p *Proxy) handleExportDownload(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/x-jsonlines")
 	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", fileName))
 	http.ServeFile(w, r, filePath)
+}
+
+// handleModelScopeUpload triggers a manual upload of exported data to ModelScope.
+func (p *Proxy) handleModelScopeUpload(w http.ResponseWriter, r *http.Request) {
+	p.handleDatasetUpload(w, r, p.config.ModelScope, "modelscope")
+}
+
+// handleHuggingFaceUpload triggers a manual upload of exported data to HuggingFace.
+func (p *Proxy) handleHuggingFaceUpload(w http.ResponseWriter, r *http.Request) {
+	p.handleDatasetUpload(w, r, p.config.HuggingFace, "huggingface")
+}
+
+// handleDatasetUpload is a generic handler for triggering dataset uploads to a platform.
+func (p *Proxy) handleDatasetUpload(w http.ResponseWriter, r *http.Request, cfg config.DatasetRepoConfig, platform string) {
+	if r.Method != "POST" {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if !cfg.Enable {
+		http.Error(w, platform+" upload is not enabled in config", http.StatusBadRequest)
+		return
+	}
+
+	go func() {
+		p.appLogger.Info("%s: manual upload triggered from API", platform)
+		var ul *uploader.DatasetUploader
+		switch platform {
+		case "huggingface":
+			ul = uploader.NewHuggingFace(cfg, p.appLogger)
+		default:
+			ul = uploader.NewModelScope(cfg, p.appLogger)
+		}
+		outDir := p.config.DailyExport.OutputDir
+		if outDir == "" {
+			outDir = "./exports"
+		}
+		if err := ul.UploadLatestExport(context.Background(), outDir); err != nil {
+			p.appLogger.Error("%s: manual upload failed: %v", platform, err)
+		}
+	}()
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusAccepted)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":  "accepted",
+		"message": platform + " upload started in background",
+	})
 }
 
 // createAuthMiddleware creates authentication middleware

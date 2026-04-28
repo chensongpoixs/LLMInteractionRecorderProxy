@@ -19,6 +19,7 @@ import (
 	"proxy-llm/logger"
 	"proxy-llm/proxy"
 	"proxy-llm/storage"
+	"proxy-llm/uploader"
 )
 
 // logLevelFromString converts string to logger.Level
@@ -205,19 +206,62 @@ func runDailyExport(ctx context.Context, cfg *config.Config, appLogger *logger.L
 		}
 		y := time.Now().In(loc).AddDate(0, 0, -1)
 		day := time.Date(y.Year(), y.Month(), y.Day(), 12, 0, 0, 0, loc)
-		outPath := filepath.Join(outDir, prefix+y.Format("20060102")+".jsonl")
 		var n int
 		var exportErr error
+		var exportPath string
 		switch strings.ToLower(c.ExportFormat) {
 		case "messages":
-			n, exportErr = exporter.ExportMessagesDay(cfg.Storage.Directory, day, outPath)
+			exportPath = filepath.Join(outDir, prefix+y.Format("20060102")+".jsonl")
+			n, exportErr = exporter.ExportMessagesDay(cfg.Storage.Directory, day, exportPath)
+		case "dataset":
+			exportPath = filepath.Join(outDir, y.Format("20060102"))
+			stats, err := exporter.ExportDatasetDay(cfg.Storage.Directory, day, exportPath)
+			if err != nil {
+				exportErr = err
+			} else {
+				n = stats.Prompts
+				appLogger.Info("daily export (dataset): %d prompts, %d responses, %d revisions, %d feedback -> %s",
+					stats.Prompts, stats.Responses, stats.Revisions, stats.Feedback, exportPath)
+			}
 		default:
-			n, exportErr = exporter.ExportDay(cfg.Storage.Directory, day, outPath)
+			exportPath = filepath.Join(outDir, prefix+y.Format("20060102")+".jsonl")
+			n, exportErr = exporter.ExportDay(cfg.Storage.Directory, day, exportPath)
 		}
 		if exportErr != nil {
 			appLogger.Warn("daily export: %v", exportErr)
 			continue
 		}
-		appLogger.Info("daily export (%s): %d rows -> %s", c.ExportFormat, n, outPath)
+		if c.ExportFormat != "dataset" {
+			appLogger.Info("daily export (%s): %d rows -> %s", c.ExportFormat, n, exportPath)
+		}
+
+	// ── Dataset uploads (ModelScope / HuggingFace) ─────────────────
+	for _, plat := range []struct {
+		name   string
+		cfg    config.DatasetRepoConfig
+		newFn  func(config.DatasetRepoConfig, *logger.Logger) *uploader.DatasetUploader
+	}{
+		{"modelscope", cfg.ModelScope, uploader.NewModelScope},
+		{"huggingface", cfg.HuggingFace, uploader.NewHuggingFace},
+	} {
+		if !plat.cfg.Enable {
+			continue
+		}
+		delay := plat.cfg.UploadDelay
+		if delay <= 0 {
+			delay = 10
+		}
+		appLogger.Info("%s: waiting %ds before upload...", plat.name, delay)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(time.Duration(delay) * time.Second):
+		}
+
+		ul := plat.newFn(plat.cfg, appLogger)
+		if err := ul.UploadLatestExport(ctx, outDir); err != nil {
+			appLogger.Warn("%s: upload failed: %v", plat.name, err)
+		}
+	}
 	}
 }

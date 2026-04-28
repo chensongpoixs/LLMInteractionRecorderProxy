@@ -6,12 +6,14 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
 	"time"
+	"unicode"
 
 	"proxy-llm/storage"
 )
@@ -605,4 +607,488 @@ func recordHash(problem, thinking, solution string) string {
 		return hexs[:16]
 	}
 	return hexs
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Industry-standard dataset export: prompts / responses / revisions / feedback
+// ──────────────────────────────────────────────────────────────────────────────
+
+// PromptRecord represents a single user prompt in the prompts/ directory.
+type PromptRecord struct {
+	ID           string `json:"id"`
+	Prompt       string `json:"prompt"`
+	SystemPrompt string `json:"system_prompt,omitempty"`
+	Language     string `json:"language"`
+	TaskCategory string `json:"task_category"`
+	TokenCount   int    `json:"token_count"`
+	Timestamp    string `json:"timestamp"`
+}
+
+// ResponseRecord represents model raw output in the responses/ directory.
+type ResponseRecord struct {
+	ID               string `json:"id"`
+	Model            string `json:"model"`
+	Provider         string `json:"provider"`
+	Thinking         string `json:"thinking,omitempty"`
+	Response         string `json:"response"`
+	PromptTokens     int    `json:"prompt_tokens"`
+	CompletionTokens int    `json:"completion_tokens"`
+	TotalTokens      int    `json:"total_tokens"`
+	LatencyMS        int64  `json:"latency_ms"`
+	Stream           bool   `json:"stream"`
+	StatusCode       int    `json:"status_code"`
+	Timestamp        string `json:"timestamp"`
+}
+
+// RevisionRecord tracks multi-turn or repeated-prompt revisions for revisions/.
+type RevisionRecord struct {
+	ID               string `json:"id"`
+	SessionID        string `json:"session_id"`
+	PromptHash       string `json:"prompt_hash"`
+	OriginalRespHash string `json:"original_response_hash,omitempty"`
+	RevisedRespHash  string `json:"revised_response_hash"`
+	TurnIndex        int    `json:"turn_index"`
+	TotalTurns       int    `json:"total_turns"`
+	RevisionType     string `json:"revision_type"`
+}
+
+// FeedbackRecord provides auto-inferred quality signals for feedback/.
+type FeedbackRecord struct {
+	ID                   string  `json:"id"`
+	QualityScore         float64 `json:"quality_score"`
+	ResponseCompleteness float64 `json:"response_completeness"`
+	HasThinking          bool    `json:"has_thinking"`
+	HasError             bool    `json:"has_error"`
+	ThinkingRatio        float64 `json:"thinking_ratio"`
+	LatencyMS            int64   `json:"latency_ms"`
+	TotalTokens          int     `json:"total_tokens"`
+	Timestamp            string  `json:"timestamp"`
+}
+
+// DatasetStats holds aggregate statistics after export.
+type DatasetStats struct {
+	TotalRecords    int            `json:"total_records"`
+	FilteredOut     int            `json:"filtered_out"`
+	Prompts         int            `json:"prompts"`
+	Responses       int            `json:"responses"`
+	Revisions       int            `json:"revisions"`
+	Feedback        int            `json:"feedback"`
+	ByLanguage      map[string]int `json:"by_language"`
+	ByTaskCategory  map[string]int `json:"by_task_category"`
+	ByModel         map[string]int `json:"by_model"`
+	TotalTokens     int            `json:"total_tokens"`
+	AvgQualityScore float64        `json:"avg_quality_score"`
+}
+
+const (
+	minPromptLength   = 5   // minimum user prompt length after cleaning
+	minResponseLength = 5   // minimum response/thinking length
+)
+
+// ExportDatasetDay filters and exports one day of logs into the industry-standard
+// 4-directory layout: prompts/, responses/, revisions/, feedback/ + metadata.csv.
+func ExportDatasetDay(storageDir string, day time.Time, outputDir string) (*DatasetStats, error) {
+	dateStr := day.Format("20060102")
+	dayDir := filepath.Join(storageDir, dateStr)
+	if st, e := os.Stat(dayDir); e != nil || !st.IsDir() {
+		return nil, fmt.Errorf("day directory not found: %s", dayDir)
+	}
+
+	logFiles := collectLogFiles(dayDir)
+	streamIndex, _ := buildStreamIndex(filepath.Join(dayDir, "streams"))
+
+	// Output directories
+	promptsDir := filepath.Join(outputDir, "prompts")
+	responsesDir := filepath.Join(outputDir, "responses")
+	revisionsDir := filepath.Join(outputDir, "revisions")
+	feedbackDir := filepath.Join(outputDir, "feedback")
+	for _, d := range []string{promptsDir, responsesDir, revisionsDir, feedbackDir} {
+		if err := os.MkdirAll(d, 0755); err != nil {
+			return nil, err
+		}
+	}
+
+	// Open output files
+	promptsFile, err := os.Create(filepath.Join(promptsDir, "prompts.jsonl"))
+	if err != nil {
+		return nil, err
+	}
+	defer promptsFile.Close()
+	respsFile, err := os.Create(filepath.Join(responsesDir, "responses.jsonl"))
+	if err != nil {
+		return nil, err
+	}
+	defer respsFile.Close()
+	revsFile, err := os.Create(filepath.Join(revisionsDir, "revisions.jsonl"))
+	if err != nil {
+		return nil, err
+	}
+	defer revsFile.Close()
+	fbFile, err := os.Create(filepath.Join(feedbackDir, "feedback.jsonl"))
+	if err != nil {
+		return nil, err
+	}
+	defer fbFile.Close()
+
+	promptEnc := json.NewEncoder(promptsFile)
+	respEnc := json.NewEncoder(respsFile)
+	revEnc := json.NewEncoder(revsFile)
+	fbEnc := json.NewEncoder(fbFile)
+
+	stats := &DatasetStats{
+		ByLanguage:     make(map[string]int),
+		ByTaskCategory: make(map[string]int),
+		ByModel:        make(map[string]int),
+	}
+
+	// For revision detection: track prompt-hash → list of (id, responseHash, turnIndex)
+	type promptOccurrence struct {
+		id         string
+		respHash  string
+		turnIndex int
+		sessionID string
+	}
+	promptHashSeen := make(map[string][]promptOccurrence)
+	// For dedup
+	seen := make(map[string]struct{})
+
+	// First pass: collect all valid records and build revision index
+	type validRecord struct {
+		rec        *storage.RequestLog
+		prompt     string
+		thinking   string
+		solution   string
+		promptHash string
+		respHash   string
+	}
+	var validRecords []validRecord
+
+	for _, lf := range logFiles {
+		f, e := os.Open(lf)
+		if e != nil {
+			continue
+		}
+		sc := bufio.NewScanner(f)
+		buf := make([]byte, 0, 64*1024)
+		sc.Buffer(buf, 16*1024*1024)
+		for sc.Scan() {
+			b := sc.Bytes()
+			if len(b) == 0 {
+				continue
+			}
+			var rec storage.RequestLog
+			if json.Unmarshal(b, &rec) != nil {
+				continue
+			}
+
+			stats.TotalRecords++
+
+			// ── Filtering ──
+			if rec.Error != "" && rec.ResponseBody == nil && rec.AggregatedResponse == nil && !rec.Stream {
+				stats.FilteredOut++
+				continue
+			}
+			if rec.StatusCode >= 400 {
+				stats.FilteredOut++
+				continue
+			}
+
+			problem := extractProblem(rec.RequestBody, rec.SystemPrompt)
+			problem = strings.TrimSpace(systemReminderRE.ReplaceAllString(problem, ""))
+			problem = strings.TrimSpace(problem)
+			if len(problem) < minPromptLength {
+				stats.FilteredOut++
+				continue
+			}
+
+			thinking, solution := extractThinkingSolution(&rec, streamIndex)
+			// For stream records, response content comes from stream chunks (may be empty if
+			// chunks aren't saved). Only require response content for non-stream records.
+			if !rec.Stream {
+				if len(strings.TrimSpace(solution)) < minResponseLength && len(strings.TrimSpace(thinking)) < minResponseLength {
+					stats.FilteredOut++
+					continue
+				}
+			}
+
+			pHash := shortHash(problem)
+			rHash := shortHash(thinking + "\n---\n" + solution)
+
+			// Dedup
+			if _, exists := seen[pHash+rHash]; exists {
+				stats.FilteredOut++
+				continue
+			}
+			seen[pHash+rHash] = struct{}{}
+
+			validRecords = append(validRecords, validRecord{
+				rec:        &rec,
+				prompt:     problem,
+				thinking:   thinking,
+				solution:   solution,
+				promptHash: pHash,
+				respHash:   rHash,
+			})
+
+			// Track for revisions
+			promptHashSeen[pHash] = append(promptHashSeen[pHash], promptOccurrence{
+				id:         rec.ID,
+				respHash:   rHash,
+				turnIndex:  rec.TurnIndex,
+				sessionID:  rec.SessionID,
+			})
+		}
+		_ = f.Close()
+	}
+
+	// Second pass: write output files
+	totalQuality := 0.0
+	for _, vr := range validRecords {
+		rec := vr.rec
+		ts := rec.Timestamp.UTC().Format(time.RFC3339Nano)
+		if strings.HasPrefix(ts, "0001-") {
+			ts = time.Now().UTC().Format(time.RFC3339Nano)
+		}
+
+		// ── prompts/ ──
+		lang := detectLanguage(vr.prompt)
+		category := inferCategory(vr.prompt, vr.solution, vr.thinking)
+		promptTokens := 0
+		if rec.TokensUsed != nil {
+			promptTokens = rec.TokensUsed["prompt_tokens"]
+		}
+		tokenCount := promptTokens
+		if tokenCount == 0 {
+			tokenCount = len([]rune(vr.prompt)) // rough estimate
+		}
+
+		promptEnc.Encode(PromptRecord{
+			ID:           fmt.Sprintf("prompt_%s", rec.ID),
+			Prompt:       vr.prompt,
+			SystemPrompt: rec.SystemPrompt,
+			Language:     lang,
+			TaskCategory: category,
+			TokenCount:   tokenCount,
+			Timestamp:    ts,
+		})
+		stats.Prompts++
+		stats.ByLanguage[lang]++
+		stats.ByTaskCategory[category]++
+
+		// ── responses/ ──
+		pt := 0
+		ct := 0
+		tt := 0
+		if rec.TokensUsed != nil {
+			pt = rec.TokensUsed["prompt_tokens"]
+			ct = rec.TokensUsed["completion_tokens"]
+			tt = rec.TokensUsed["total_tokens"]
+		}
+		if tt == 0 {
+			tt = pt + ct
+		}
+
+		respEnc.Encode(ResponseRecord{
+			ID:               fmt.Sprintf("resp_%s", rec.ID),
+			Model:            rec.Model,
+			Provider:         rec.Provider,
+			Thinking:         vr.thinking,
+			Response:         vr.solution,
+			PromptTokens:     pt,
+			CompletionTokens: ct,
+			TotalTokens:      tt,
+			LatencyMS:        parseLatency(rec.Duration),
+			Stream:           rec.Stream,
+			StatusCode:       rec.StatusCode,
+			Timestamp:        ts,
+		})
+		stats.Responses++
+		stats.ByModel[rec.Model]++
+		stats.TotalTokens += tt
+
+		// ── feedback/ ──
+		qs, completeness := computeQuality(rec, vr.thinking, vr.solution)
+		thinkingRatio := 0.0
+		fullLen := len(vr.thinking) + len(vr.solution)
+		if fullLen > 0 {
+			thinkingRatio = float64(len(vr.thinking)) / float64(fullLen)
+		}
+
+		fbEnc.Encode(FeedbackRecord{
+			ID:                   fmt.Sprintf("fb_%s", rec.ID),
+			QualityScore:         math.Round(qs*100) / 100,
+			ResponseCompleteness: math.Round(completeness*100) / 100,
+			HasThinking:          len(vr.thinking) > 0,
+			HasError:             rec.Error != "",
+			ThinkingRatio:        math.Round(thinkingRatio*1000) / 1000,
+			LatencyMS:            parseLatency(rec.Duration),
+			TotalTokens:          tt,
+			Timestamp:            ts,
+		})
+		stats.Feedback++
+		totalQuality += qs
+	}
+
+	// ── revisions/ ──
+	// Emit revision records for sessions with multiple turns or repeated prompts.
+	for pHash, occurrences := range promptHashSeen {
+		if len(occurrences) < 2 {
+			continue
+		}
+		// Group by session
+		sessionGroups := make(map[string][]promptOccurrence)
+		for _, o := range occurrences {
+			sid := o.sessionID
+			if sid == "" {
+				sid = "_global"
+			}
+			sessionGroups[sid] = append(sessionGroups[sid], o)
+		}
+		for _, group := range sessionGroups {
+			if len(group) < 2 {
+				continue
+			}
+			sort.Slice(group, func(i, j int) bool { return group[i].turnIndex < group[j].turnIndex })
+			for i := 1; i < len(group); i++ {
+				revType := "multi_turn"
+				if group[i].sessionID == "" || group[i].sessionID == "_global" {
+					revType = "repeated_prompt"
+				}
+				rec := RevisionRecord{
+					ID:              fmt.Sprintf("rev_%s_%d", pHash, i),
+					SessionID:       group[i].sessionID,
+					PromptHash:      pHash,
+					RevisedRespHash: group[i].respHash,
+					TurnIndex:       group[i].turnIndex,
+					TotalTurns:      len(group),
+					RevisionType:    revType,
+				}
+				if i > 0 {
+					rec.OriginalRespHash = group[i-1].respHash
+				}
+				revEnc.Encode(rec)
+				stats.Revisions++
+			}
+		}
+	}
+
+	if stats.Feedback > 0 {
+		stats.AvgQualityScore = math.Round(totalQuality/float64(stats.Feedback)*100) / 100
+	}
+
+	// ── metadata.csv ──
+	writeDatasetMetadataCSV(outputDir, stats, dateStr, len(logFiles))
+
+	return stats, nil
+}
+
+func detectLanguage(text string) string {
+	cjk := 0
+	ascii := 0
+	total := 0
+	for _, r := range text {
+		if unicode.Is(unicode.Han, r) || unicode.Is(unicode.Hiragana, r) || unicode.Is(unicode.Katakana, r) {
+			cjk++
+		} else if r < 128 && r >= 32 {
+			ascii++
+		}
+		total++
+	}
+	if total == 0 {
+		return "unknown"
+	}
+	cjkRatio := float64(cjk) / float64(total)
+	if cjkRatio > 0.3 {
+		return "zh"
+	}
+	asciiRatio := float64(ascii) / float64(total)
+	if asciiRatio > 0.7 {
+		return "en"
+	}
+	return "mixed"
+}
+
+func computeQuality(rec *storage.RequestLog, thinking, solution string) (score, completeness float64) {
+	score = 0.5 // baseline
+	completeness = 0.5
+
+	if rec.Error != "" {
+		score -= 0.4
+		completeness -= 0.3
+	}
+	if rec.StatusCode >= 400 {
+		score -= 0.3
+		completeness -= 0.2
+	}
+
+	solLen := len(strings.TrimSpace(solution))
+	thinkLen := len(strings.TrimSpace(thinking))
+
+	if solLen > 100 {
+		score += 0.2
+		completeness += 0.2
+	}
+	if thinkLen > 50 {
+		score += 0.15
+		completeness += 0.15
+	}
+	if solLen > 1000 {
+		score += 0.1
+		completeness += 0.1
+	}
+
+	// Clamp
+	score = math.Max(0.0, math.Min(1.0, score))
+	completeness = math.Max(0.0, math.Min(1.0, completeness))
+	return
+}
+
+func shortHash(s string) string {
+	h := sha256.Sum256([]byte(s))
+	return hex.EncodeToString(h[:])[:16]
+}
+
+func parseLatency(raw string) int64 {
+	d, err := time.ParseDuration(strings.TrimSpace(raw))
+	if err != nil {
+		return 0
+	}
+	return d.Milliseconds()
+}
+
+// writeDatasetMetadataCSV generates metadata.csv for the dataset directory.
+func writeDatasetMetadataCSV(outputDir string, stats *DatasetStats, dateStr string, fileCount int) {
+	csvPath := filepath.Join(outputDir, "metadata.csv")
+	f, err := os.Create(csvPath)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+
+	f.WriteString("field,value\n")
+	fmt.Fprintf(f, "export_date,%s\n", dateStr)
+	fmt.Fprintf(f, "source_log_files,%d\n", fileCount)
+	fmt.Fprintf(f, "total_records_scanned,%d\n", stats.TotalRecords)
+	fmt.Fprintf(f, "records_filtered_out,%d\n", stats.FilteredOut)
+	fmt.Fprintf(f, "valid_prompts,%d\n", stats.Prompts)
+	fmt.Fprintf(f, "valid_responses,%d\n", stats.Responses)
+	fmt.Fprintf(f, "revision_pairs,%d\n", stats.Revisions)
+	fmt.Fprintf(f, "feedback_records,%d\n", stats.Feedback)
+	fmt.Fprintf(f, "total_tokens,%d\n", stats.TotalTokens)
+	fmt.Fprintf(f, "avg_quality_score,%.2f\n", stats.AvgQualityScore)
+	fmt.Fprintf(f, "filter_min_prompt_length,%d\n", minPromptLength)
+	fmt.Fprintf(f, "filter_min_response_length,%d\n", minResponseLength)
+
+	// Language distribution
+	for lang, count := range stats.ByLanguage {
+		fmt.Fprintf(f, "language_%s,%d\n", lang, count)
+	}
+	// Task category distribution
+	for cat, count := range stats.ByTaskCategory {
+		fmt.Fprintf(f, "category_%s,%d\n", cat, count)
+	}
+	// Model distribution
+	for model, count := range stats.ByModel {
+		fmt.Fprintf(f, "model_%s,%d\n", model, count)
+	}
 }
