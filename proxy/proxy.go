@@ -1,4 +1,58 @@
+/******************************************************************************
+ *  Copyright (c) 2025 The LLM Interaction Recorder & Proxy — 大模型交互日志与数据沉淀代理 project authors. All Rights Reserved.
+ *
+ *  Please visit https://chensongpoixs.github.io for detail
+ *
+ *  Use of this source code is governed by a BSD-style license
+ *  that can be found in the LICENSE file in the root of the source
+ *  tree. An additional intellectual property rights grant can be found
+ *  in the file PATENTS.  All contributing project authors may
+ *  be found in the AUTHORS file in the root of the source tree.
+ ******************************************************************************/
+ /*****************************************************************************
+                   Author: chensong
+                   date:  2026-04-26
+输赢不重要，答案对你们有什么意义才重要。
+
+光阴者，百代之过客也，唯有奋力奔跑，方能生风起时，是时代造英雄，英雄存在于时代。或许世人道你轻狂，可你本就年少啊。 看护好，自己的理想和激情。
+
+
+我可能会遇到很多的人，听他们讲好2多的故事，我来写成故事或编成歌，用我学来的各种乐器演奏它。
+然后还可能在一个国家遇到一个心仪我的姑娘，她可能会被我帅气的外表捕获，又会被我深邃的内涵吸引，在某个下雨的夜晚，她会全身淋透然后要在我狭小的住处换身上的湿衣服。
+3小时候后她告诉我她其实是这个国家的公主，她愿意向父皇求婚。我不得已告诉她我是穿越而来的男主角，我始终要回到自己的世界。
+然后我的身影慢慢消失，我看到她眼里的泪水，心里却没有任何痛苦，我才知道，原来我的心被丢掉了，我游历全世界的原因，就是要找回自己的本心。
+于是我开始有意寻找各种各样失去心的人，我变成一块砖头，一颗树，一滴水，一朵白云，去听大家为什么会失去自己的本心。
+我发现，刚出生的宝宝，本心还在，慢慢的，他们的本心就会消失，收到了各种黑暗之光的侵蚀。
+从一次争论，到嫉妒和悲愤，还有委屈和痛苦，我看到一只只无形的手，把他们的本心扯碎，蒙蔽，偷走，再也回不到主人都身边。
+我叫他本心猎手。他可能是和宇宙同在的级别 但是我并不害怕，我仔细回忆自己平淡的一生 寻找本心猎手的痕迹。
+沿着自己的回忆，一个个的场景忽闪而过，最后发现，我的本心，在我写代码的时候，会回来。
+安静，淡然，代码就是我的一切，写代码就是我本心回归的最好方式，我还没找到本心猎手，但我相信，顺着这个线索，我一定能顺藤摸瓜，把他揪出来。
+
+ ******************************************************************************/
+
 package proxy
+
+// ===========================================================================
+// @author  chensong
+// @date    2026-04-26
+// @brief   核心代理模块 — LLM API 请求透明转发中枢
+//
+// proxy 包是 proxy-llm 服务的核心模块，实现以下关键能力：
+//   - OpenAI Chat Completions API 透明转发（含流式 SSE）
+//   - Anthropic Messages API 直通转发（Anthropic 兼容端点）
+//   - Anthropic ↔ OpenAI 协议双向转换（请求重写 + 响应格式适配）
+//   - 多模型负载路由（根据请求中的 model 参数匹配配置）
+//   - 请求/响应数据的持久化记录（JSONL 存储 + SSE chunk 实时落盘）
+//   - 多轮对话上下文追踪（per-session message chain, 线程安全）
+//   - Token 字段跨格式规范化（llama.cpp ↔ OpenAI）
+//   - HTTP 中间件链（CORS、API Key 鉴权、404 日志）
+//   - Usage Dashboard 前端页面托管（内嵌 Vue 3 单文件应用）
+//   - Agent/ReAct 智能体聊天（SSE 事件流）
+//   - 数据导出与平台上传端点（ModelScope / HuggingFace）
+//
+// @note 本文件是项目中最大的源文件，包含核心代理逻辑、协议转换器、
+//       数据导出 API、以及所有 HTTP 中间件。
+// ===========================================================================
 
 import (
 	"bufio"
@@ -23,16 +77,60 @@ import (
 	"proxy-llm/uploader"
 )
 
-// idSeq is combined with time.Now().UnixNano() so req/up IDs stay unique when the clock
-// returns the same value twice (e.g. two concurrent POSTs on Windows) — that looked like
-// "one [REQ:...] but two upstream calls" in logs.
+// idSeq 全局原子计数器，与 time.Now().UnixNano() 组合生成唯一 ID，
+// 解决高并发场景下同一纳秒内多个 POST 请求 ID 冲突的问题（尤其在 Windows 上）。
+//
+// @author  chensong
+// @date    2026-04-26
 var idSeq atomic.Uint64
+
+// nextUniqueID 生成全局唯一的请求标识符。
+//
+// 格式: "{UnixNano}_{seq}"，如 "1704067200000000000_42"
+// seq 由原子的 idSeq 递增，确保同一纳秒内的多次调用产生不同 ID。
+//
+// @author  chensong
+// @date    2026-04-26
+// @return 全局唯一 ID 字符串
+// nextUniqueID 生成全局唯一请求标识符，格式 "{UnixNano}_{seq}"。
+// @author chensong  @date 2026-04-26
 
 func nextUniqueID() string {
 	return fmt.Sprintf("%d_%d", time.Now().UnixNano(), idSeq.Add(1))
 }
 
-// Proxy handles forwarding requests to LLM APIs
+// Proxy 是代理服务的核心结构体，负责请求转发、协议转换、数据持久化和生命周期管理。
+//
+// @author  chensong
+// @date    2026-04-26
+// @brief   核心代理结构体
+//
+// 字段说明:
+//   - server:        HTTP 服务器实例，管理端口监听和优雅关闭
+//   - clients:       模型名 -> HTTP 客户端的映射，每个模型独立复用连接池
+//   - config:         全局服务配置引用
+//   - logger:         存储层日志记录器，负责请求/响应的文件持久化
+//   - handler:        HTTP 处理器集合（健康检查、用量统计、提示词浏览等）
+//   - metrics:        指标采集器（请求计数、延迟、响应大小等）
+//   - authMw:         API Key 鉴权中间件（nil 表示未启用）
+//   - appLogger:      应用日志记录器
+//   - conversations:  多轮对话追踪 Map（sessionID -> conversationState），线程安全
+//   - exportMu:       导出操作互斥锁，防止并发导出
+//
+// @note  clients 中的 HTTP Client 不设 Timeout，因为 SSE 流式连接可能持续数分钟。
+// Proxy 是核心代理结构体，管理 HTTP 转发、协议转换、数据持久化。
+// @author chensong  @date 2026-04-26
+// @field server         - HTTP 服务器实例
+// @field clients        - 模型名->HTTP客户端映射（无 Timeout，适配 SSE）
+// @field config         - 全局服务配置
+// @field logger         - 存储层日志（请求/响应 JSONL 落盘）
+// @field handler        - HTTP 处理器集合（用量统计/提示词浏览）
+// @field metrics        - 指标采集器
+// @field authMw         - API Key 鉴权中间件
+// @field appLogger      - 应用日志记录器
+// @field conversations  - sync.Map: sessionID -> conversationState 多轮对话追踪
+// @field exportMu       - 导出操作互斥锁
+
 type Proxy struct {
 	server    *http.Server
 	clients   map[string]*http.Client
@@ -50,6 +148,17 @@ type Proxy struct {
 }
 
 // New creates a new proxy instance
+// New 创建代理实例，初始化 HTTP 客户端、注册路由、配置中间件。
+// 处理流程:
+//   1. 为每个配置模型创建独立 HTTP Client（连接池: 100 conns, 10/host, 90s idle）
+//   2. 注册代理路由（/v1/chat/completions, /v1/messages 等）
+//   3. 注册用量统计、提示词浏览、Agent 聊天端点
+//   4. 注册数据导出与平台上传端点
+//   5. 按配置应用 CORS 和 Auth 中间件
+//   6. 包裹 404 日志捕获器
+// @author chensong  @date 2026-04-26
+// @return 初始化后的 Proxy 实例
+
 func New(cfg *config.Config, storageLogger *storage.Logger, metrics *Metrics, appLogger *logger.Logger) *Proxy {
 	appLogger.Info("Initializing proxy server...")
 
@@ -156,18 +265,29 @@ func New(cfg *config.Config, storageLogger *storage.Logger, metrics *Metrics, ap
 }
 
 // generateRequestID creates a unique request ID for tracking
+// generateRequestID 创建请求唯一标识符，格式 "req_{uniqueID}"。
+// @author chensong  @date 2026-04-26
+
 func (p *Proxy) generateRequestID() string {
 	return "req_" + nextUniqueID()
 }
 
 // conversationState wraps a conversation history slice with a per-session mutex
 // to prevent read-modify-write races when concurrent requests target the same session.
+// conversationState 包装对话历史切片，提供 per-session mutex 保护。
+// 解决 sync.Map Load-Modify-Store 竞态条件导致的 message 丢失问题。
+// @author chensong  @date 2026-04-26
+
 type conversationState struct {
 	mu      sync.Mutex
 	history []storage.MessageLog
 }
 
 // getConversationHistory retrieves a snapshot of the message chain for a session.
+// getConversationHistory 获取指定 session 的完整对话历史。
+// 从 conversations sync.Map 中加载 conversationState，加锁读取历史。
+// @author chensong  @date 2026-04-26
+
 func (p *Proxy) getConversationHistory(sessionID string) []storage.MessageLog {
 	val, _ := p.conversations.LoadOrStore(sessionID, &conversationState{})
 	cs := val.(*conversationState)
@@ -179,6 +299,10 @@ func (p *Proxy) getConversationHistory(sessionID string) []storage.MessageLog {
 }
 
 // appendConversation appends new messages to a session's conversation chain.
+// appendConversation 向 session 追加用户消息和助手回复。
+// 使用 per-session mutex 保证并发安全，避免 Load-Modify-Store 竞态。
+// @author chensong  @date 2026-04-26
+
 func (p *Proxy) appendConversation(sessionID string, userMsgs []storage.MessageLog, assistantMsg storage.MessageLog) {
 	val, _ := p.conversations.LoadOrStore(sessionID, &conversationState{})
 	cs := val.(*conversationState)
@@ -192,6 +316,10 @@ func (p *Proxy) appendConversation(sessionID string, userMsgs []storage.MessageL
 
 // extractAndUpdateConversation extracts messages from request, assembles full conversation,
 // and returns (messages, systemPrompt, turnIndex, conversationID).
+// extractAndUpdateConversation 从请求体提取消息、更新对话历史。
+// 返回完整的 messages 链、系统提示、轮次索引、会话 ID。
+// @author chensong  @date 2026-04-26
+
 func (p *Proxy) extractAndUpdateConversation(sessionID string, reqBody map[string]interface{}, provider string) ([]storage.MessageLog, string, int, string) {
 	convID := "conv_" + sessionID
 	messages, systemPrompt, _ := storage.ExtractMessagesFromRequest(reqBody)
@@ -209,6 +337,9 @@ func (p *Proxy) extractAndUpdateConversation(sessionID string, reqBody map[strin
 }
 
 // getSessionID returns the session ID from request header or model name.
+// getSessionID 从请求中提取或生成 session ID。
+// @author chensong  @date 2026-04-26
+
 func (p *Proxy) getSessionID(r *http.Request, modelName string, isStream bool) string {
 	if sid := r.Header.Get("X-Session-ID"); sid != "" {
 		return sid
@@ -221,6 +352,10 @@ func (p *Proxy) getSessionID(r *http.Request, modelName string, isStream bool) s
 }
 
 // buildAssistantMessage constructs a MessageLog from a parsed OpenAI-style response.
+// buildAssistantMessage 从 OpenAI 响应构建 MessageLog。
+// 提取 content/reasoning_content/tool_calls 字段。
+// @author chensong  @date 2026-04-26
+
 func (p *Proxy) buildAssistantMessage(respParsed map[string]interface{}) storage.MessageLog {
 	if len(respParsed) == 0 {
 		return storage.MessageLog{}
@@ -251,6 +386,17 @@ func (p *Proxy) buildAssistantMessage(respParsed map[string]interface{}) storage
 	}
 }
 // handleRequest creates an HTTP handler for a specific endpoint
+// handleRequest 创建 OpenAI 兼容端点的 HTTP Handler。
+// 处理流程:
+//   1. 解析请求体并克隆（用于日志记录）
+//   2. 提取 model 参数，匹配配置中的模型
+//   3. 翻译模型名称（proxy 名 -> 上游名）
+//   4. 构建上游 HTTP 请求（URL/Headers/Body）
+//   5. 处理流式请求 → handleStreaming（SSE 透传 + chunk 落盘）
+//   6. 处理非流式请求 → 读取完整响应、规范化 tokens、记录日志
+//   7. 更新多轮对话追踪（extractAndUpdateConversation）
+// @author chensong  @date 2026-04-26
+
 func (p *Proxy) handleRequest(endpoint string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		reqID := p.generateRequestID()
@@ -480,6 +626,15 @@ func (p *Proxy) handleRequest(endpoint string) http.HandlerFunc {
 }
 
 // handleAnthropicMessages adapts Anthropic Messages API requests to OpenAI chat/completions
+// handleAnthropicMessages 适配 Anthropic Messages API → OpenAI Chat Completions。
+// 处理流程:
+//   1. 解析 Anthropic 格式请求体
+//   2. 如果模型配置了 base_url_anthropic → handleAnthropicPassthrough（直通）
+//   3. 否则 convertAnthropicMessagesToOpenAI 转换 + 调用 OpenAI 端点
+//   4. 将 OpenAI 响应转换回 Anthropic Messages 格式
+//   5. 流式请求 → handleAnthropicMessagesStream
+// @author chensong  @date 2026-04-26
+
 func (p *Proxy) handleAnthropicMessages() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		reqID := p.generateRequestID()
@@ -724,6 +879,13 @@ func (p *Proxy) handleAnthropicMessages() http.HandlerFunc {
 }
 
 // handleAnthropicMessagesStream adapts OpenAI-style SSE to Anthropic Messages SSE events.
+// handleAnthropicMessagesStream 将 OpenAI SSE 转换为 Anthropic SSE 事件流。
+// 事件映射:
+//   首 chunk → message_start + content_block_start
+//   content delta → content_block_delta (text_delta / thinking_delta / input_json_delta)
+//   末 chunk → content_block_stop + message_delta + message_stop
+// @author chensong  @date 2026-04-26
+
 func (p *Proxy) handleAnthropicMessagesStream(w http.ResponseWriter, r *http.Request, chatReq map[string]interface{}, modelName string, start time.Time, requestLogger *logger.Logger) {
 	reqBytes, _ := json.Marshal(chatReq)
 	targetURL := fmt.Sprintf("%s/%s", p.getModelBaseURL(modelName), "chat/completions")
@@ -1140,6 +1302,10 @@ func (p *Proxy) handleAnthropicMessagesStream(w http.ResponseWriter, r *http.Req
 
 // handleAnthropicPassthrough forwards a raw Anthropic request directly to an
 // Anthropic-compatible upstream endpoint without any protocol conversion.
+// handleAnthropicPassthrough 将 Anthropic 请求直通转发（非流式）。
+// 直接转发原始请求体到 Anthropic 兼容端点，不做协议转换。
+// @author chensong  @date 2026-04-26
+
 func (p *Proxy) handleAnthropicPassthrough(w http.ResponseWriter, r *http.Request, rawBody []byte, modelName, anthropicBase string, start time.Time, requestLogger *logger.Logger) {
 	targetURL := anthropicBase + "/messages"
 	proxyReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, targetURL, bytes.NewReader(rawBody))
@@ -1215,6 +1381,10 @@ func (p *Proxy) handleAnthropicPassthrough(w http.ResponseWriter, r *http.Reques
 // handleAnthropicPassthroughStream forwards a raw streaming Anthropic request
 // directly to an Anthropic-compatible upstream endpoint. SSE events are relayed
 // as-is without any format conversion.
+// handleAnthropicPassthroughStream 将 Anthropic 流式请求直通转发。
+// 解析上游 SSE 行，在线累积 content/reasoning 构建 AggregatedResponse。
+// @author chensong  @date 2026-04-26
+
 func (p *Proxy) handleAnthropicPassthroughStream(w http.ResponseWriter, r *http.Request, rawBody []byte, modelName, anthropicBase string, start time.Time, requestLogger *logger.Logger) {
 	targetURL := anthropicBase + "/messages"
 	proxyReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, targetURL, bytes.NewReader(rawBody))
@@ -1414,6 +1584,17 @@ func (p *Proxy) handleAnthropicPassthroughStream(w http.ResponseWriter, r *http.
 }
 
 // handleStreaming manages streaming responses
+// handleStreaming 管理 SSE 流式响应的转发。
+// 处理流程:
+//   1. 发送上游请求，获取响应流
+//   2. 设置客户端 SSE 响应头（text/event-stream）
+//   3. 逐行读取上游 SSE chunks
+//   4. 规范化 token 字段名（llama.cpp -> OpenAI 格式）
+//   5. 转发 chunk 到客户端并 flush
+//   6. 保存每个 chunk 到 storage（实时落盘）
+//   7. 流结束后构建 AggregatedResponse 并保存完整日志
+// @author chensong  @date 2026-04-26
+
 func (p *Proxy) handleStreaming(w http.ResponseWriter, r *http.Request, proxyReq *http.Request, client *http.Client, reqBody map[string]interface{}, modelName string, start time.Time, endpoint string, requestLogger *logger.Logger, upstreamCallID string, upstreamStart time.Time, _ []byte) {
 	requestLogger.Info("=== Streaming mode initiated ===")
 
@@ -1597,6 +1778,9 @@ func (p *Proxy) handleStreaming(w http.ResponseWriter, r *http.Request, proxyReq
 }
 
 // getModelBaseURL returns the base URL for a model
+// getModelBaseURL 查找模型对应的 OpenAI 兼容 Base URL。
+// @author chensong  @date 2026-04-26
+
 func (p *Proxy) getModelBaseURL(modelName string) string {
 	for _, model := range p.config.Models {
 		if model.Name == modelName {
@@ -1608,6 +1792,9 @@ func (p *Proxy) getModelBaseURL(modelName string) string {
 
 // getModelBaseURLAnthropic returns the Anthropic-compatible base URL for a model.
 // Returns empty string if not configured (caller should fall back to OpenAI conversion path).
+// getModelBaseURLAnthropic 查找模型对应的 Anthropic 兼容 Base URL。
+// @author chensong  @date 2026-04-26
+
 func (p *Proxy) getModelBaseURLAnthropic(modelName string) string {
 	for _, model := range p.config.Models {
 		if model.Name == modelName {
@@ -1618,6 +1805,9 @@ func (p *Proxy) getModelBaseURLAnthropic(modelName string) string {
 }
 
 // getAPIKey returns the API key for a model
+// getAPIKey 查找模型的 API Key。
+// @author chensong  @date 2026-04-26
+
 func (p *Proxy) getAPIKey(modelName string) string {
 	for _, model := range p.config.Models {
 		if model.Name == modelName {
@@ -1628,6 +1818,9 @@ func (p *Proxy) getAPIKey(modelName string) string {
 }
 
 // getModelByProxyName returns the full ModelConfig for a proxy model name
+// getModelByProxyName 根据 proxy 配置名查找 ModelConfig。
+// @author chensong  @date 2026-04-26
+
 func (p *Proxy) getModelByProxyName(modelName string) *config.ModelConfig {
 	for _, model := range p.config.Models {
 		if model.Name == modelName {
@@ -1639,6 +1832,9 @@ func (p *Proxy) getModelByProxyName(modelName string) *config.ModelConfig {
 
 // translateModelNameInBody updates the model name in request body from proxy name to target model name.
 // Returns false if the model field is missing or not a string.
+// translateModelNameInBody 将请求体中的 proxy 模型名翻译为上游实际模型名。
+// @author chensong  @date 2026-04-26
+
 func (p *Proxy) translateModelNameInBody(reqBody map[string]interface{}) bool {
 	modelRaw, exists := reqBody["model"]
 	if !exists {
@@ -1657,6 +1853,9 @@ func (p *Proxy) translateModelNameInBody(reqBody map[string]interface{}) bool {
 }
 
 // logRequest logs a request/response pair
+// logRequest 记录请求日志到 storage（简化版，内部调用 logRequestFull）。
+// @author chensong  @date 2026-04-26
+
 func (p *Proxy) logRequest(reqBody map[string]interface{}, modelName, endpoint string, start time.Time, statusCode int, respBody []byte, isStream bool, errorMsg string, tokensUsed map[string]int, requestLogger *logger.Logger) {
 	sessionID := fmt.Sprintf("session_%s", modelName)
 	if isStream {
@@ -1693,6 +1892,9 @@ func (p *Proxy) logRequest(reqBody map[string]interface{}, modelName, endpoint s
 }
 
 // logRequestFull logs a request/response pair with full conversation context.
+// logRequestFull 记录完整请求日志，包含对话上下文、聚合响应、token 统计。
+// @author chensong  @date 2026-04-26
+
 func (p *Proxy) logRequestFull(reqBody map[string]interface{}, messages []storage.MessageLog, systemPrompt, sessionID, conversationID string, turnIndex int, modelName, endpoint string, start time.Time, statusCode int, respBody []byte, aggregatedResponse map[string]interface{}, isStream bool, errorMsg string, tokensUsed map[string]int, requestLogger *logger.Logger) {
 	reqLog := &storage.RequestLog{
 		ID:                 "req_" + nextUniqueID(),
@@ -1731,6 +1933,10 @@ func (p *Proxy) logRequestFull(reqBody map[string]interface{}, messages []storag
 
 // extractTokens extracts token usage from response
 // Supports both OpenAI standard (prompt_tokens) and llama.cpp (input_tokens) field names
+// extractTokens 从响应中提取 token 使用量。
+// 兼容 OpenAI (usage.prompt_tokens) 和 llama.cpp (timings.prompt_n) 两种格式。
+// @author chensong  @date 2026-04-26
+
 func (p *Proxy) extractTokens(resp map[string]interface{}) map[string]int {
 	tokens := make(map[string]int)
 
@@ -1774,6 +1980,10 @@ func (p *Proxy) extractTokens(resp map[string]interface{}) map[string]int {
 // 2. Converts OpenAI token field names to llama.cpp field names (input_tokens/output_tokens)
 // 3. Removes llama.cpp timings object (replaced by usage)
 // Claude Code expects input_tokens/output_tokens when connecting to llama.cpp
+// normalizeTokens 将 llama.cpp 响应格式转换为 OpenAI 标准格式。
+// 修复非标准 token 字段名，确保 Claude Code 等客户端能正确解析。
+// @author chensong  @date 2026-04-26
+
 func (p *Proxy) normalizeTokens(respBody []byte) []byte {
 	var resp map[string]interface{}
 	if err := json.Unmarshal(respBody, &resp); err != nil {
@@ -1828,6 +2038,10 @@ func (p *Proxy) normalizeTokens(respBody []byte) []byte {
 // normalizeStreamChunk converts token field names in a streaming chunk
 // This handles both chat.completion and chat.completion.chunk object types
 // Also converts llama.cpp timings to usage format for Claude Code
+// normalizeStreamChunk 规范化流式 chunk 中的 token 字段名。
+// 对每个 SSE data 行进行字段名替换。
+// @author chensong  @date 2026-04-26
+
 func (p *Proxy) normalizeStreamChunk(chunkData []byte) []byte {
 	var chunk map[string]interface{}
 	if err := json.Unmarshal(chunkData, &chunk); err != nil {
@@ -1916,6 +2130,9 @@ func (p *Proxy) normalizeStreamChunk(chunkData []byte) []byte {
 
 // getProxyModelName returns the proxy model name for a llama.cpp model filename
 // Uses case-insensitive comparison and strips .gguf extension
+// getProxyModelName 将上游模型名反译为 proxy 配置名。
+// @author chensong  @date 2026-04-26
+
 func (p *Proxy) getProxyModelName(modelName string) string {
 	// Strip .gguf extension and convert to lowercase for comparison
 	normalized := strings.ToLower(modelName)
@@ -1937,6 +2154,10 @@ func (p *Proxy) getProxyModelName(modelName string) string {
 }
 
 // handleModels returns the list of available models for Claude Code validation
+// handleModels 返回已配置模型列表（OpenAI /v1/models 格式）。
+// 用于 Claude Code 等客户端的模型验证。
+// @author chensong  @date 2026-04-26
+
 func (p *Proxy) handleModels(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "GET" {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -1970,6 +2191,9 @@ func (p *Proxy) handleModels(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleExportDates lists dates with available log data in the storage directory.
+// handleExportDates 列出存储目录中所有可用数据的日期列表。
+// @author chensong  @date 2026-04-26
+
 func (p *Proxy) handleExportDates(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "GET" {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -2044,6 +2268,10 @@ func (p *Proxy) handleExportDates(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleExportDay triggers export for a specific day.
+// handleExportDay 触发指定日期的数据导出。
+// 根据 export_format 参数调用 exporter.ExportDay/ExportMessagesDay/ExportDatasetDay。
+// @author chensong  @date 2026-04-26
+
 func (p *Proxy) handleExportDay(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -2125,6 +2353,9 @@ func (p *Proxy) handleExportDay(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleExportDownload serves an exported file for download.
+// handleExportDownload 提供导出文件下载。
+// @author chensong  @date 2026-04-26
+
 func (p *Proxy) handleExportDownload(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "GET" {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -2158,16 +2389,25 @@ func (p *Proxy) handleExportDownload(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleModelScopeUpload triggers a manual upload of exported data to ModelScope.
+// handleModelScopeUpload 触发 ModelScope 数据集上传。
+// @author chensong  @date 2026-04-26
+
 func (p *Proxy) handleModelScopeUpload(w http.ResponseWriter, r *http.Request) {
 	p.handleDatasetUpload(w, r, p.config.ModelScope, "modelscope")
 }
 
 // handleHuggingFaceUpload triggers a manual upload of exported data to HuggingFace.
+// handleHuggingFaceUpload 触发 HuggingFace 数据集上传。
+// @author chensong  @date 2026-04-26
+
 func (p *Proxy) handleHuggingFaceUpload(w http.ResponseWriter, r *http.Request) {
 	p.handleDatasetUpload(w, r, p.config.HuggingFace, "huggingface")
 }
 
 // handleDatasetUpload is a generic handler for triggering dataset uploads to a platform.
+// handleDatasetUpload 通用数据集上传处理器，异步执行 Git push。
+// @author chensong  @date 2026-04-26
+
 func (p *Proxy) handleDatasetUpload(w http.ResponseWriter, r *http.Request, cfg config.DatasetRepoConfig, platform string) {
 	if r.Method != "POST" {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -2206,6 +2446,10 @@ func (p *Proxy) handleDatasetUpload(w http.ResponseWriter, r *http.Request, cfg 
 }
 
 // createAuthMiddleware creates authentication middleware
+// createAuthMiddleware 创建 API Key 鉴权中间件。
+// 验证请求头中的 auth_header 是否匹配配置的 auth_token。
+// @author chensong  @date 2026-04-26
+
 func (p *Proxy) createAuthMiddleware() func(http.HandlerFunc) http.HandlerFunc {
 	return func(next http.HandlerFunc) http.HandlerFunc {
 		return func(w http.ResponseWriter, r *http.Request) {
@@ -2226,6 +2470,10 @@ func (p *Proxy) createAuthMiddleware() func(http.HandlerFunc) http.HandlerFunc {
 }
 
 // createCORSMiddleware creates CORS middleware using configured AllowedOrigins.
+// createCORSMiddleware 创建 CORS 中间件。
+// 根据 AllowedOrigins 配置设置 Access-Control-* 响应头。
+// @author chensong  @date 2026-04-26
+
 func (p *Proxy) createCORSMiddleware(next http.Handler) http.Handler {
 	allowedOrigins := p.config.Proxy.AllowedOrigins
 	// Fallback: if no origins configured, allow all.
@@ -2266,6 +2514,10 @@ func (p *Proxy) createCORSMiddleware(next http.Handler) http.Handler {
 }
 
 // create404Logger wraps handler to log unregistered endpoints
+// create404Logger 包裹 handler，捕获 404 响应并输出 JSON 格式错误。
+// 使用 noWriteStatusCapturingWriter 拦截 ServeMux 默认的纯文本 404。
+// @author chensong  @date 2026-04-26
+
 func (p *Proxy) create404Logger(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Wrap response writer to capture status code without writing to original
@@ -2306,6 +2558,10 @@ func (p *Proxy) create404Logger(next http.Handler) http.Handler {
 }
 
 // noWriteStatusCapturingWriter captures status code without writing to original
+// noWriteStatusCapturingWriter 拦截 ServeMux 的 404 响应。
+// 用于 create404Logger 中间件，将默认的 404 纯文本转换为 JSON 错误响应。
+// @author chensong  @date 2026-04-26
+
 type noWriteStatusCapturingWriter struct {
 	http.ResponseWriter
 	statusCode int
@@ -2681,6 +2937,9 @@ func (w *noWriteStatusCapturingWriter) Flush() {
 }
 
 // Start begins serving HTTP requests
+// Start 启动 HTTP 服务器，开始监听配置的 host:port。
+// @author chensong  @date 2026-04-26
+
 func (p *Proxy) Start() error {
 	p.appLogger.Info("Starting proxy server on %s", p.server.Addr)
 	if p.config.Server.TLSCert != "" && p.config.Server.TLSKey != "" {
@@ -2691,6 +2950,9 @@ func (p *Proxy) Start() error {
 }
 
 // Shutdown gracefully stops the server
+// Shutdown 优雅关闭 HTTP 服务器，等待现有请求完成。
+// @author chensong  @date 2026-04-26
+
 func (p *Proxy) Shutdown(ctx context.Context) error {
 	p.appLogger.Info("Shutting down proxy server...")
 	return p.server.Shutdown(ctx)
