@@ -1300,6 +1300,125 @@ func (p *Proxy) handleAnthropicMessagesStream(w http.ResponseWriter, r *http.Req
 	p.logRequest(chatReq, modelName, "messages", start, resp.StatusCode, respBytes, true, "", usage, requestLogger)
 }
 
+// fixAnthropicThinkingBlocksForPassthrough 检查 Anthropic 请求中助手消息是否缺 thinking 块，
+// 从对话历史中注入缺失的 thinking 块。DeepSeek thinking 模式要求多轮对话中
+// content[].thinking 必须原样传回。
+// @author chensong  @date 2026-04-28
+func (p *Proxy) fixAnthropicThinkingBlocksForPassthrough(rawBody []byte, sessionID string) []byte {
+	var req map[string]interface{}
+	if err := json.Unmarshal(rawBody, &req); err != nil {
+		return rawBody
+	}
+	messages, ok := req["messages"].([]interface{})
+	if !ok || len(messages) == 0 {
+		return rawBody
+	}
+	// collect assistant messages missing thinking blocks
+	type missingInfo struct{ idx int }
+	var missing []missingInfo
+	for i, m := range messages {
+		msg, ok := m.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		role, _ := msg["role"].(string)
+		if role != "assistant" {
+			continue
+		}
+		if hasThinkingBlock(msg["content"]) {
+			continue
+		}
+		missing = append(missing, missingInfo{idx: i})
+	}
+	if len(missing) == 0 {
+		return rawBody
+	}
+	// reverse-match: last missing assistant gets last stored reasoning
+	history := p.getConversationHistory(sessionID)
+	var candidates []string
+	for i := len(history) - 1; i >= 0; i-- {
+		if history[i].Role == "assistant" && history[i].Reasoning != "" {
+			candidates = append(candidates, history[i].Reasoning)
+		}
+	}
+	for j, mi := range missing {
+		var reasoning string
+		ridx := len(candidates) - 1 - j
+		if ridx >= 0 {
+			reasoning = candidates[ridx]
+		}
+		// if no history available, use empty thinking block to satisfy
+		// DeepSeek validation that requires thinking blocks to exist
+		msg := messages[mi.idx].(map[string]interface{})
+		existing, _ := msg["content"].([]interface{})
+		if existing == nil {
+			existing = []interface{}{}
+		}
+		thinkingBlock := map[string]interface{}{
+			"type":     "thinking",
+			"thinking": reasoning,
+		}
+		newContent := make([]interface{}, 0, len(existing)+1)
+		newContent = append(newContent, thinkingBlock)
+		newContent = append(newContent, existing...)
+		msg["content"] = newContent
+	}
+	fixed, err := json.Marshal(req)
+	if err != nil {
+		return rawBody
+	}
+	return fixed
+}
+
+// hasThinkingBlock checks if Anthropic content array contains a thinking block.
+func hasThinkingBlock(content interface{}) bool {
+	arr, ok := content.([]interface{})
+	if !ok {
+		return false
+	}
+	for _, block := range arr {
+		if bm, ok := block.(map[string]interface{}); ok {
+			if typ, _ := bm["type"].(string); typ == "thinking" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// recordAnthropicPassthroughConversation extracts the assistant message from
+// an Anthropic-format response and stores it in the conversation tracker for
+// future thinking-block injection.
+// @author chensong  @date 2026-04-28
+func (p *Proxy) recordAnthropicPassthroughConversation(respParsed map[string]interface{}, sessionID string) {
+	var thinking, text string
+	if content, ok := respParsed["content"].([]interface{}); ok {
+		for _, block := range content {
+			bm, ok := block.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			typ, _ := bm["type"].(string)
+			switch typ {
+			case "thinking":
+				if t, ok := bm["thinking"].(string); ok {
+					thinking += t
+				}
+			case "text":
+				if t, ok := bm["text"].(string); ok {
+					text += t
+				}
+			}
+		}
+	}
+	assistantMsg := storage.MessageLog{
+		Role:      "assistant",
+		Content:   strings.TrimSpace(text),
+		Reasoning: strings.TrimSpace(thinking),
+	}
+	p.appendConversation(sessionID, nil, assistantMsg)
+}
+
 // handleAnthropicPassthrough forwards a raw Anthropic request directly to an
 // Anthropic-compatible upstream endpoint without any protocol conversion.
 // handleAnthropicPassthrough 将 Anthropic 请求直通转发（非流式）。
@@ -1307,8 +1426,14 @@ func (p *Proxy) handleAnthropicMessagesStream(w http.ResponseWriter, r *http.Req
 // @author chensong  @date 2026-04-26
 
 func (p *Proxy) handleAnthropicPassthrough(w http.ResponseWriter, r *http.Request, rawBody []byte, modelName, anthropicBase string, start time.Time, requestLogger *logger.Logger) {
+	sessionID := r.Header.Get("X-Session-ID")
+	if sessionID == "" {
+		sessionID = "session_" + modelName
+	}
+	// inject missing thinking blocks for DeepSeek thinking mode
+	fixedBody := p.fixAnthropicThinkingBlocksForPassthrough(rawBody, sessionID)
 	targetURL := anthropicBase + "/messages"
-	proxyReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, targetURL, bytes.NewReader(rawBody))
+	proxyReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, targetURL, bytes.NewReader(fixedBody))
 	if err != nil {
 		requestLogger.Error("Failed to create Anthropic passthrough request: %v", err)
 		http.Error(w, "Failed to create proxy request", http.StatusInternalServerError)
@@ -1370,6 +1495,10 @@ func (p *Proxy) handleAnthropicPassthrough(w http.ResponseWriter, r *http.Reques
 
 	var respParsed map[string]interface{}
 	json.Unmarshal(respBody, &respParsed)
+	// record conversation for future thinking-block injection
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		p.recordAnthropicPassthroughConversation(respParsed, sessionID)
+	}
 	tokensUsed := p.extractTokens(respParsed)
 	p.logRequest(nil, modelName, "messages", start, resp.StatusCode, respBody, false, "", tokensUsed, requestLogger)
 
@@ -1386,8 +1515,14 @@ func (p *Proxy) handleAnthropicPassthrough(w http.ResponseWriter, r *http.Reques
 // @author chensong  @date 2026-04-26
 
 func (p *Proxy) handleAnthropicPassthroughStream(w http.ResponseWriter, r *http.Request, rawBody []byte, modelName, anthropicBase string, start time.Time, requestLogger *logger.Logger) {
+	sessionID := r.Header.Get("X-Session-ID")
+	if sessionID == "" {
+		sessionID = fmt.Sprintf("session_%s_stream", modelName)
+	}
+	// inject missing thinking blocks for DeepSeek thinking mode
+	fixedBody := p.fixAnthropicThinkingBlocksForPassthrough(rawBody, sessionID)
 	targetURL := anthropicBase + "/messages"
-	proxyReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, targetURL, bytes.NewReader(rawBody))
+	proxyReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, targetURL, bytes.NewReader(fixedBody))
 	if err != nil {
 		requestLogger.Error("Failed to create Anthropic passthrough stream request: %v", err)
 		http.Error(w, "Failed to create proxy request", http.StatusInternalServerError)
@@ -1562,9 +1697,14 @@ func (p *Proxy) handleAnthropicPassthroughStream(w http.ResponseWriter, r *http.
 		}
 	}
 
-	sessionID := r.Header.Get("X-Session-ID")
-	if sessionID == "" {
-		sessionID = fmt.Sprintf("session_%s_stream", modelName)
+	// record conversation for future thinking-block injection
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		assistantMsg := storage.MessageLog{
+			Role:      "assistant",
+			Content:   strings.TrimSpace(aggregatedContent),
+			Reasoning: strings.TrimSpace(aggregatedReasoning),
+		}
+		p.appendConversation(sessionID, nil, assistantMsg)
 	}
 	reqLog := &storage.RequestLog{
 		ID:                 "req_" + nextUniqueID(),
