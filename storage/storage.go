@@ -69,7 +69,7 @@ type ResponseStream struct {
 
 // Logger handles writing request/response data to files
 type Logger struct {
-	mu      sync.Mutex
+	mu      sync.RWMutex
 	dir     string
 	format  string
 	rotate  string
@@ -99,21 +99,16 @@ func NewLogger(dir, format, rotate, maxSize string, compress bool) (*Logger, err
 
 // SaveRequest saves a request with its response to a log file
 func (l *Logger) SaveRequest(req *RequestLog) error {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-
 	fileName := l.buildFileName(req)
-	file, err := os.OpenFile(fileName, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
-	if err != nil {
-		return fmt.Errorf("failed to open log file: %w", err)
-	}
-	defer file.Close()
 
+	// Marshal and optionally compress outside the lock to avoid
+	// blocking concurrent callers during CPU-heavy work.
 	data, err := json.Marshal(req)
 	if err != nil {
 		return fmt.Errorf("failed to marshal request log: %w", err)
 	}
 
+	var payload []byte
 	if l.gzip {
 		var buf bytes.Buffer
 		writer, err := gzip.NewWriterLevel(&buf, gzip.BestCompression)
@@ -122,19 +117,25 @@ func (l *Logger) SaveRequest(req *RequestLog) error {
 		}
 		writer.Write(append(data, '\n'))
 		writer.Close()
-		_, err = file.Write(buf.Bytes())
-		return err
+		payload = buf.Bytes()
+	} else {
+		payload = append(data, '\n')
 	}
 
-	_, err = file.Write(append(data, '\n'))
+	l.mu.Lock()
+	file, err := os.OpenFile(fileName, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		l.mu.Unlock()
+		return fmt.Errorf("failed to open log file: %w", err)
+	}
+	_, err = file.Write(payload)
+	file.Close()
+	l.mu.Unlock()
 	return err
 }
 
 // SaveStreamChunk saves a single streaming response chunk
 func (l *Logger) SaveStreamChunk(chunk *ResponseStream) error {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-
 	dateStr := chunk.Timestamp.Format("20060102")
 	if dateStr == "00010101" {
 		dateStr = time.Now().Format("20060102")
@@ -148,20 +149,24 @@ func (l *Logger) SaveStreamChunk(chunk *ResponseStream) error {
 	if sessionID == "" {
 		sessionID = "default"
 	}
-	fileName := filepath.Join(streamDir, fmt.Sprintf("%s_%s", sessionID, dateStr))
+	fileName := filepath.Join(streamDir, fmt.Sprintf("%s_%s", sessionID, dateStr)) + ".jsonl"
 
-	file, err := os.OpenFile(fileName+".jsonl", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-
+	// Marshal outside the lock.
 	data, err := json.Marshal(chunk)
 	if err != nil {
 		return err
 	}
+	payload := append(data, '\n')
 
-	_, err = file.Write(append(data, '\n'))
+	l.mu.Lock()
+	file, err := os.OpenFile(fileName, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		l.mu.Unlock()
+		return err
+	}
+	_, err = file.Write(payload)
+	file.Close()
+	l.mu.Unlock()
 	return err
 }
 
@@ -203,7 +208,9 @@ func (l *Logger) ListLogs(sessionID, date string) ([]string, error) {
 	return files, nil
 }
 
-// ReadLog reads and returns all entries from a log file
+// ReadLog reads and returns all entries from a log file.
+// NOTE: does not acquire the write lock; concurrent writes may produce
+// a temporarily inconsistent view, which is acceptable for the dashboard.
 func (l *Logger) ReadLog(filePath string) ([]json.RawMessage, error) {
 	data, err := os.ReadFile(filePath)
 	if err != nil {

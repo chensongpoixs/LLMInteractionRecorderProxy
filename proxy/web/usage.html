@@ -339,6 +339,122 @@
       .prompts-layout { grid-template-columns: 1fr; }
       .prompts-sidebar { position: static; }
     }
+
+    /* Agent chat tab */
+    .agent-layout {
+      display: flex; flex-direction: column; height: calc(100vh - 180px); min-height: 500px;
+    }
+    .agent-topbar {
+      display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+      padding: 10px 14px; background: var(--card); border: 1px solid var(--line);
+      border-radius: 10px; margin-bottom: 12px;
+    }
+    .agent-topbar select {
+      background: var(--card); color: var(--text); border: 1px solid var(--line);
+      border-radius: 6px; padding: 5px 10px; font-size: 13px; cursor: pointer; font-family: var(--font);
+    }
+    .tool-toggle {
+      display: flex; align-items: center; gap: 4px; font-size: 12px;
+      color: var(--text-secondary); cursor: pointer; user-select: none;
+    }
+    .tool-toggle input { accent-color: var(--accent); }
+
+    .agent-chat {
+      flex: 1; overflow-y: auto; padding: 8px 4px;
+      display: flex; flex-direction: column; gap: 8px;
+    }
+    .agent-msg { display: flex; flex-direction: column; }
+    .agent-msg.user { align-items: flex-end; }
+    .agent-msg.assistant, .agent-msg.response { align-items: flex-start; }
+
+    .agent-bubble {
+      max-width: 80%; padding: 10px 14px; border-radius: 10px;
+      font-size: 13px; line-height: 1.6; white-space: pre-wrap; word-break: break-word;
+    }
+    .agent-bubble.user {
+      background: var(--accent); color: #fff; border-bottom-right-radius: 2px;
+    }
+    .agent-bubble.assistant {
+      background: var(--card); color: var(--text); border: 1px solid var(--line);
+      border-bottom-left-radius: 2px;
+    }
+    .agent-bubble.error {
+      background: var(--red-bg); color: var(--red); border: 1px solid rgba(239,68,68,0.3);
+      max-width: 90%; font-size: 12px;
+    }
+
+    .agent-thinking-box {
+      background: rgba(167,139,250,0.06); border-left: 3px solid var(--output-color);
+      border-radius: 0 8px 8px 0; margin: 2px 0; overflow: hidden;
+    }
+    .think-header {
+      display: flex; align-items: center; gap: 6px; padding: 8px 12px;
+      font-size: 12px; font-weight: 600; color: var(--output-color);
+      cursor: pointer; user-select: none; text-transform: uppercase; letter-spacing: 0.3px;
+    }
+    .think-header:hover { background: rgba(167,139,250,0.04); }
+    .think-body {
+      padding: 0 12px 10px; font-size: 12px; line-height: 1.6;
+      color: var(--text-secondary); white-space: pre-wrap; word-break: break-word;
+      font-family: 'SF Mono', 'Fira Code', monospace;
+      border-top: 1px solid rgba(167,139,250,0.08);
+    }
+
+    .agent-action-card {
+      background: rgba(245,158,11,0.08); border: 1px solid rgba(245,158,11,0.2);
+      border-radius: 8px; padding: 8px 12px; margin: 2px 0;
+      font-size: 12px; color: var(--orange); font-family: 'SF Mono', 'Fira Code', monospace;
+    }
+
+    .agent-obs-box {
+      background: rgba(255,255,255,0.02); border-left: 3px solid var(--text-muted);
+      border-radius: 0 8px 8px 0; margin: 2px 0; overflow: hidden;
+    }
+    .obs-header {
+      display: flex; align-items: center; gap: 6px; padding: 8px 12px;
+      font-size: 12px; font-weight: 600; color: var(--text-secondary);
+      cursor: pointer; user-select: none; text-transform: uppercase; letter-spacing: 0.3px;
+    }
+    .obs-header:hover { background: rgba(255,255,255,0.02); }
+    .obs-body {
+      padding: 0 12px 10px; margin: 0; font-size: 11px; line-height: 1.5;
+      color: var(--text-muted); white-space: pre-wrap; word-break: break-word;
+      font-family: 'SF Mono', 'Fira Code', monospace;
+      border-top: 1px solid rgba(255,255,255,0.04);
+      max-height: 300px; overflow-y: auto;
+    }
+
+    .agent-input-area {
+      display: flex; gap: 10px; align-items: flex-end; margin-top: 12px;
+      padding: 12px 14px; background: var(--card); border: 1px solid var(--line);
+      border-radius: 10px;
+    }
+    .agent-input-area textarea {
+      flex: 1; background: var(--bg); color: var(--text); border: 1px solid var(--line);
+      border-radius: 8px; padding: 10px 12px; font-size: 13px; line-height: 1.5;
+      font-family: var(--font); resize: none; outline: none;
+    }
+    .agent-input-area textarea:focus { border-color: var(--accent); }
+    .agent-input-area textarea::placeholder { color: var(--text-muted); }
+    .agent-input-area .btn-primary { padding: 10px 24px; font-size: 14px; }
+
+    .agent-loading {
+      display: flex; align-items: center; gap: 8px; padding: 8px 12px;
+      color: var(--text-muted); font-size: 13px;
+    }
+    .dots::after {
+      content: ''; animation: dots 1.5s steps(4, end) infinite;
+    }
+    @keyframes dots {
+      0% { content: ''; } 25% { content: '.'; } 50% { content: '..'; } 75% { content: '...'; } 100% { content: ''; }
+    }
+
+    @media (max-width: 768px) {
+      .agent-layout { height: calc(100vh - 200px); }
+      .agent-bubble { max-width: 92%; }
+      .agent-topbar { gap: 6px; padding: 8px 10px; }
+      .agent-topbar select { font-size: 12px; padding: 4px 8px; }
+    }
   </style>
 </head>
 <body>
@@ -374,6 +490,7 @@
       <button :class="['tab-btn', { active: activeTab === 'usage' }]" @click="activeTab = 'usage'">用量统计</button>
       <button :class="['tab-btn', { active: activeTab === 'export' }]" @click="activeTab = 'export'; loadExportDates()">数据导出</button>
       <button :class="['tab-btn', { active: activeTab === 'prompts' }]" @click="activeTab = 'prompts'; loadPromptDates()">提示词浏览</button>
+      <button :class="['tab-btn', { active: activeTab === 'agent' }]" @click="activeTab = 'agent'; initAgentModels()">Agent 聊天</button>
     </div>
 
     <!-- ============ USAGE TAB ============ -->
@@ -706,9 +823,87 @@
                 <button class="btn-sm" :disabled="prompts.page <= 1" @click="goPromptPage(prompts.page - 1)">上一页</button>
                 <span class="page-info">{{ prompts.page }} / {{ prompts.total_pages }}</span>
                 <button class="btn-sm" :disabled="prompts.page >= prompts.total_pages" @click="goPromptPage(prompts.page + 1)">下一页</button>
+                <span style="margin-left:8px">跳转</span>
+                <input class="page-jump" v-model="jumpPage" @keyup.enter="jumpToPage" placeholder="页" style="width:45px;text-align:center">
+                <button class="btn-sm" @click="jumpToPage">GO</button>
               </div>
             </template>
           </template>
+        </div>
+      </div>
+    </template>
+
+    <!-- Agent chat tab -->
+    <template v-if="activeTab === 'agent'">
+      <div class="agent-layout">
+        <div class="agent-topbar">
+          <select v-model="agentModel">
+            <option v-for="m in agentModels" :value="m">{{ m }}</option>
+          </select>
+          <label class="tool-toggle"><input type="checkbox" v-model="agentTools.bash"> bash</label>
+          <label class="tool-toggle"><input type="checkbox" v-model="agentTools.read_file"> read_file</label>
+          <label class="tool-toggle"><input type="checkbox" v-model="agentTools.write_file"> write_file</label>
+          <label class="tool-toggle"><input type="checkbox" v-model="agentTools.grep"> grep</label>
+          <label class="tool-toggle"><input type="checkbox" v-model="agentTools.glob"> glob</label>
+          <button @click="clearAgentChat" class="btn-sm" style="margin-left:auto;">清空</button>
+        </div>
+
+        <div class="agent-chat" ref="agentChat">
+          <template v-if="agentMessages.length === 0 && !agentLoading">
+            <div style="flex:1;display:flex;align-items:center;justify-content:center;color:var(--text-muted);font-size:14px;">
+              <div style="text-align:center;">
+                <div style="font-size:40px;margin-bottom:12px;">🤖</div>
+                <div>输入任务描述，Agent 会自动使用工具执行</div>
+              </div>
+            </div>
+          </template>
+
+          <div v-for="(msg, idx) in agentMessages" :key="idx" :class="['agent-msg', msg.role]">
+            <!-- User message -->
+            <div v-if="msg.role === 'user'" class="agent-bubble user">{{ msg.content }}</div>
+
+            <!-- Thinking -->
+            <div v-if="msg.role === 'thinking'" class="agent-thinking-box">
+              <div class="think-header" @click="msg.collapsed = !msg.collapsed">
+                <span>🧠 思考 #{{ msg.iteration }}</span>
+                <span style="font-size:10px;margin-left:4px;">{{ msg.collapsed ? '▸' : '▾' }}</span>
+              </div>
+              <div v-if="!msg.collapsed" class="think-body">{{ msg.content }}</div>
+            </div>
+
+            <!-- Action -->
+            <div v-if="msg.role === 'action'" class="agent-action-card">
+              <div>🔧 <strong>{{ msg.tool }}</strong> {{ msg.args }}</div>
+              <div style="color:var(--text-muted);font-size:11px;margin-top:2px;">{{ msg.descriptor }}</div>
+            </div>
+
+            <!-- Observation -->
+            <div v-if="msg.role === 'observation'" class="agent-obs-box">
+              <div class="obs-header" @click="msg.collapsed = !msg.collapsed">
+                <span>📋 观测结果 #{{ msg.iteration }}</span>
+                <span style="font-size:10px;margin-left:4px;">{{ msg.collapsed ? '▸' : '▾' }}</span>
+              </div>
+              <pre v-if="!msg.collapsed" class="obs-body">{{ msg.content }}</pre>
+            </div>
+
+            <!-- Final response -->
+            <div v-if="msg.role === 'response'" class="agent-bubble assistant">{{ msg.content }}</div>
+
+            <!-- Error -->
+            <div v-if="msg.role === 'error'" class="agent-bubble error">❌ {{ msg.content }}</div>
+          </div>
+
+          <!-- Loading indicator -->
+          <div v-if="agentLoading" class="agent-loading">
+            <span class="spin" style="width:12px;height:12px;"></span>
+            <span>Agent 思考中</span><span class="dots"></span>
+          </div>
+        </div>
+
+        <div class="agent-input-area">
+          <textarea v-model="agentInput" @keydown.ctrl.enter="sendAgentMessage"
+            placeholder="输入任务，Agent 自动使用工具执行（Ctrl+Enter 发送）..." rows="2"></textarea>
+          <button @click="sendAgentMessage" :disabled="agentLoading || !agentInput.trim()" class="btn-primary">发送</button>
         </div>
       </div>
     </template>
@@ -741,8 +936,12 @@
           selectedDate: null,
           promptsLoading: false,
           prompts: { items: [], total: 0, page: 1, per_page: 20, total_pages: 0 },
-          promptsPage: 1, expandedId: null,
+          promptsPage: 1, expandedId: null, jumpPage: '',
           toast: { show: false, message: '', type: 'success' },
+          // Agent tab state
+          agentModel: '', agentModels: [],
+          agentTools: { bash: true, read_file: true, write_file: true, grep: true, glob: true },
+          agentMessages: [], agentInput: '', agentLoading: false,
         };
       },
       computed: {
@@ -922,6 +1121,15 @@
           this.loadPrompts();
         },
         toggleExpand(id) { this.expandedId = this.expandedId === id ? null : id; },
+        jumpToPage() {
+          const n = parseInt(this.jumpPage, 10);
+          if (isNaN(n) || n < 1 || n > this.prompts.total_pages) {
+            this.showToast('页码超出范围', 'error');
+            return;
+          }
+          this.goPromptPage(n);
+          this.jumpPage = '';
+        },
         hasThinking(item) {
           if (!item.response_full) return false;
           return item.response_full.startsWith('【思考过程】');
@@ -943,6 +1151,122 @@
           if (idx > 0) return text.substring(idx + '【回复】\n'.length).trim();
           if (!text.startsWith('【思考过程】')) return text;
           return '';
+        },
+
+        // === Agent tab ===
+        initAgentModels() {
+          // Extract model names from the model tags in the prompts list, or use a default
+          fetch('/v1/models?t=' + Date.now(), { cache: "no-store" })
+            .then(r => r.json())
+            .then(data => {
+              const models = data.data || data.models || [];
+              this.agentModels = models.map(m => typeof m === 'string' ? m : (m.id || m.name || '')).filter(Boolean);
+              if (this.agentModels.length > 0 && !this.agentModel) this.agentModel = this.agentModels[0];
+            })
+            .catch(() => {
+              this.agentModels = ['DeepSeekV4'];
+              if (!this.agentModel) this.agentModel = 'DeepSeekV4';
+            });
+        },
+        clearAgentChat() { this.agentMessages = []; },
+        scrollAgentToBottom() {
+          this.$nextTick(() => {
+            const el = this.$refs.agentChat;
+            if (el) el.scrollTop = el.scrollHeight;
+          });
+        },
+        async sendAgentMessage() {
+          const msg = this.agentInput.trim();
+          if (!msg || this.agentLoading) return;
+          if (!this.agentModel) {
+            this.showToast('请先选择模型', 'error');
+            return;
+          }
+          const enabledTools = Object.entries(this.agentTools).filter(([, v]) => v).map(([k]) => k);
+          if (enabledTools.length === 0) {
+            this.showToast('请至少启用一个工具', 'error');
+            return;
+          }
+
+          this.agentMessages.push({ role: 'user', content: msg });
+          this.agentInput = '';
+          this.agentLoading = true;
+          this.scrollAgentToBottom();
+
+          try {
+            const res = await fetch('/api/chat/agent', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ model: this.agentModel, message: msg, tools: enabledTools }),
+            });
+
+            if (!res.ok) {
+              const errText = await res.text();
+              this.agentMessages.push({ role: 'error', content: '请求失败: ' + (errText || res.statusText) });
+              this.agentLoading = false;
+              return;
+            }
+
+            const reader = res.body.getReader();
+            const decoder = new TextDecoder();
+            let buf = '';
+
+            while (true) {
+              const { done, value } = await reader.read();
+              if (done) break;
+              buf += decoder.decode(value, { stream: true });
+
+              // Parse SSE events
+              const lines = buf.split('\n');
+              buf = '';
+              let eventType = '';
+              for (let i = 0; i < lines.length; i++) {
+                const line = lines[i];
+                if (line.startsWith('event: ')) {
+                  eventType = line.slice(7).trim();
+                } else if (line.startsWith('data: ')) {
+                  const dataStr = line.slice(6);
+                  try {
+                    const data = JSON.parse(dataStr);
+                    switch (eventType) {
+                      case 'thinking':
+                        this.agentMessages.push({ role: 'thinking', iteration: data.iteration, content: data.thought, collapsed: false });
+                        break;
+                      case 'action':
+                        this.agentMessages.push({ role: 'action', iteration: data.iteration, tool: data.tool, args: data.arguments, descriptor: data.descriptor });
+                        break;
+                      case 'observation':
+                        this.agentMessages.push({ role: 'observation', iteration: data.iteration, content: data.result, collapsed: true });
+                        break;
+                      case 'response':
+                        this.agentMessages.push({ role: 'response', content: data.content });
+                        break;
+                      case 'done':
+                        // nothing to add, just cleanup
+                        break;
+                      case 'error':
+                        this.agentMessages.push({ role: 'error', content: data.message });
+                        break;
+                    }
+                  } catch (e) {
+                    // Partial data — put back in buffer
+                    buf = line + '\n' + lines.slice(i + 1).join('\n');
+                    i = lines.length;
+                  }
+                  eventType = '';
+                } else if (line.trim() !== '') {
+                  buf += line + '\n';
+                }
+              }
+              this.scrollAgentToBottom();
+            }
+          } catch (err) {
+            console.error('Agent chat error:', err);
+            this.agentMessages.push({ role: 'error', content: '连接失败: ' + err.message });
+          } finally {
+            this.agentLoading = false;
+            this.scrollAgentToBottom();
+          }
         },
       },
       mounted() {

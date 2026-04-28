@@ -155,3 +155,11 @@ huggingface:
   upload_delay: 15
   git_branch: "main"
 
+
+# =============================================================================
+# Agent / ReAct 配置
+# =============================================================================
+agent:
+  workspace_dir: "./agent_workspace"
+  max_iterations: 15
+  bash_timeout: 30

@@ -86,6 +86,13 @@ type DatasetRepoConfig struct {
 	GitBranch   string `yaml:"git_branch"`   // Remote branch to push to (default: "master" for ModelScope, "main" for HF)
 }
 
+// AgentConfig defines ReAct agent behaviour.
+type AgentConfig struct {
+	WorkspaceDir  string `yaml:"workspace_dir"`  // 工具操作沙箱目录（默认 "./agent_workspace"）
+	MaxIterations int    `yaml:"max_iterations"` // ReAct 最大循环次数（默认 15）
+	BashTimeout   int    `yaml:"bash_timeout"`   // bash 命令超时秒数（默认 30）
+}
+
 // Config is the root configuration structure
 type Config struct {
 	Server      ServerConfig      `yaml:"server"`
@@ -97,6 +104,7 @@ type Config struct {
 	DailyExport DailyExportConfig `yaml:"daily_export"`
 	ModelScope  DatasetRepoConfig `yaml:"modelscope"`
 	HuggingFace DatasetRepoConfig `yaml:"huggingface"`
+	Agent       AgentConfig       `yaml:"agent"`
 }
 
 // ProxyConfig defines proxy behavior
@@ -247,6 +255,11 @@ func DefaultConfig() *Config {
 			DataSubdir:  "data",
 			UploadDelay: 10,
 			GitBranch:   "main",
+		},
+		Agent: AgentConfig{
+			WorkspaceDir:  "./agent_workspace",
+			MaxIterations: 15,
+			BashTimeout:   30,
 		},
 	}
 }

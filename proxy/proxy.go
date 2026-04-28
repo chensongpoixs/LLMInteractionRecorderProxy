@@ -98,6 +98,9 @@ func New(cfg *config.Config, storageLogger *storage.Logger, metrics *Metrics, ap
 	mux.HandleFunc("/api/prompts/dates", proxy.handler.HandlePromptDates)
 	mux.HandleFunc("/api/prompts", proxy.handler.HandlePromptList)
 
+	// Agent chat endpoint (ReAct)
+	mux.HandleFunc("/api/chat/agent", proxy.handleAgentChat)
+
 	// Export endpoints
 	mux.HandleFunc("/api/export/dates", proxy.handleExportDates)
 	mux.HandleFunc("/api/export/day", proxy.handleExportDay)
@@ -157,24 +160,34 @@ func (p *Proxy) generateRequestID() string {
 	return "req_" + nextUniqueID()
 }
 
-// getConversationHistory retrieves the message chain for a session, creating one if absent.
-func (p *Proxy) getConversationHistory(sessionID string) []storage.MessageLog {
-	val, _ := p.conversations.LoadOrStore(sessionID, []storage.MessageLog{})
-	return val.([]storage.MessageLog)
+// conversationState wraps a conversation history slice with a per-session mutex
+// to prevent read-modify-write races when concurrent requests target the same session.
+type conversationState struct {
+	mu      sync.Mutex
+	history []storage.MessageLog
 }
 
-// appendConversation appends new assistant messages to a session'''s conversation chain.
+// getConversationHistory retrieves a snapshot of the message chain for a session.
+func (p *Proxy) getConversationHistory(sessionID string) []storage.MessageLog {
+	val, _ := p.conversations.LoadOrStore(sessionID, &conversationState{})
+	cs := val.(*conversationState)
+	cs.mu.Lock()
+	snapshot := make([]storage.MessageLog, len(cs.history))
+	copy(snapshot, cs.history)
+	cs.mu.Unlock()
+	return snapshot
+}
+
+// appendConversation appends new messages to a session's conversation chain.
 func (p *Proxy) appendConversation(sessionID string, userMsgs []storage.MessageLog, assistantMsg storage.MessageLog) {
-	val, _ := p.conversations.Load(sessionID)
-	history := []storage.MessageLog{}
-	if val != nil {
-		history = append(history, val.([]storage.MessageLog)...)
-	}
-	history = append(history, userMsgs...)
+	val, _ := p.conversations.LoadOrStore(sessionID, &conversationState{})
+	cs := val.(*conversationState)
+	cs.mu.Lock()
+	cs.history = append(cs.history, userMsgs...)
 	if assistantMsg.Role != "" {
-		history = append(history, assistantMsg)
+		cs.history = append(cs.history, assistantMsg)
 	}
-	p.conversations.Store(sessionID, history)
+	cs.mu.Unlock()
 }
 
 // extractAndUpdateConversation extracts messages from request, assembles full conversation,

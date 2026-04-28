@@ -720,6 +720,19 @@ func (h *Handler) buildPromptList(dateFilter string, page, perPage int) (promptL
 		return allItems[i].Timestamp > allItems[j].Timestamp
 	})
 
+	// Deduplicate: keep only the latest entry per unique prompt.
+	// Multi-turn conversations produce multiple API calls with the same
+	// last user message; we only need one entry per distinct question.
+	seen := make(map[string]bool, len(allItems))
+	deduped := make([]promptListItem, 0, len(allItems))
+	for _, it := range allItems {
+		if !seen[it.PromptFull] {
+			seen[it.PromptFull] = true
+			deduped = append(deduped, it)
+		}
+	}
+	allItems = deduped
+
 	total := len(allItems)
 	totalPages := (total + perPage - 1) / perPage
 	if totalPages < 1 {
@@ -900,6 +913,10 @@ func isSystemMessage(text string) bool {
 		return true
 	}
 	if strings.HasPrefix(text, "CRITICAL:") {
+		return true
+	}
+	// XML-style system/task notifications from Claude Code
+	if strings.HasPrefix(text, "<task-notification>") || strings.HasPrefix(text, "<system-reminder>") {
 		return true
 	}
 	return false
