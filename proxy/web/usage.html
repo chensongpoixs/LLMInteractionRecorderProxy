@@ -4,458 +4,8 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Proxy LLM Dashboard</title>
+  <link rel="stylesheet" href="/static/css/style.css">
   <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
-  <style>
-    :root {
-      --bg: #0d0f14;
-      --card: #161920;
-      --card-hover: #1c202b;
-      --line: #262a35;
-      --line-hover: #3a3f50;
-      --text: #e8edf5;
-      --text-secondary: #8b95b0;
-      --text-muted: #5c647a;
-      --accent: #6c8cff;
-      --accent-bg: rgba(108,140,255,0.12);
-      --green: #34d399;
-      --green-bg: rgba(52,211,153,0.12);
-      --orange: #f59e0b;
-      --orange-bg: rgba(245,158,11,0.1);
-      --red: #ef4444;
-      --red-bg: rgba(239,68,68,0.1);
-      --blue: #60a5fa;
-      --input-color: #6c8cff;
-      --output-color: #a78bfa;
-      --font: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Inter", "PingFang SC", "Microsoft YaHei", sans-serif;
-    }
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    body {
-      font-family: var(--font);
-      background: var(--bg);
-      color: var(--text);
-      min-height: 100vh;
-      -webkit-font-smoothing: antialiased;
-    }
-    .app { max-width: 1100px; margin: 0 auto; padding: 24px 20px 48px; }
-
-    /* Tabs */
-    .tabs {
-      display: flex; gap: 0; margin-bottom: 24px;
-      border-bottom: 1px solid var(--line);
-    }
-    .tab-btn {
-      padding: 10px 24px; font-size: 14px; font-weight: 500;
-      background: none; border: none; color: var(--text-secondary);
-      cursor: pointer; font-family: var(--font);
-      border-bottom: 2px solid transparent; margin-bottom: -1px;
-      transition: color .15s, border-color .15s;
-    }
-    .tab-btn:hover { color: var(--text); }
-    .tab-btn.active { color: var(--accent); border-bottom-color: var(--accent); }
-
-    /* Header */
-    .top-bar {
-      display: flex; justify-content: space-between; align-items: center;
-      margin-bottom: 8px; flex-wrap: wrap; gap: 12px;
-    }
-    .logo-area { display: flex; align-items: center; gap: 12px; }
-    .logo-icon {
-      width: 32px; height: 32px; border-radius: 8px;
-      background: linear-gradient(135deg, var(--accent), var(--output-color));
-      display: flex; align-items: center; justify-content: center;
-      font-weight: 700; font-size: 16px; color: #fff;
-    }
-    .logo-text { font-size: 18px; font-weight: 600; }
-    .logo-sub { font-size: 12px; color: var(--text-secondary); margin-top: 1px; }
-    .top-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-    .top-actions select, .top-actions button {
-      background: var(--card); color: var(--text); border: 1px solid var(--line);
-      border-radius: 8px; padding: 6px 12px; font-size: 13px;
-      cursor: pointer; font-family: var(--font);
-    }
-    .top-actions select { padding: 6px 28px 6px 12px; appearance: auto; }
-    .top-actions button:hover { background: var(--card-hover); border-color: var(--line-hover); }
-    .status-dot {
-      display: inline-block; width: 6px; height: 6px; border-radius: 50%;
-      margin-right: 6px;
-    }
-    .status-dot.on { background: var(--green); box-shadow: 0 0 6px var(--green); }
-    .status-dot.off { background: var(--text-muted); }
-
-    /* Summary Grid */
-    .summary-grid {
-      display: grid; grid-template-columns: repeat(4, 1fr);
-      gap: 12px; margin-bottom: 16px;
-    }
-    .summary-card {
-      background: var(--card); border: 1px solid var(--line);
-      border-radius: 12px; padding: 16px 18px;
-      transition: border-color .15s, background .15s;
-    }
-    .summary-card:hover { border-color: var(--line-hover); background: var(--card-hover); }
-    .summary-card .label {
-      font-size: 12px; color: var(--text-secondary); font-weight: 500;
-      display: flex; align-items: center; gap: 6px; margin-bottom: 4px;
-    }
-    .summary-card .value {
-      font-size: 24px; font-weight: 700; letter-spacing: -0.02em;
-    }
-    .summary-card .sub {
-      font-size: 12px; color: var(--text-muted); margin-top: 4px;
-    }
-    .ratio-bar {
-      display: flex; height: 3px; border-radius: 2px; overflow: hidden;
-      margin-top: 10px; gap: 2px;
-    }
-    .ratio-bar .in { background: var(--input-color); }
-    .ratio-bar .out { background: var(--output-color); }
-    .ratio-labels { display: flex; justify-content: space-between; font-size: 11px; color: var(--text-muted); margin-top: 5px; }
-
-    /* Two column layout */
-    .two-col { display: grid; grid-template-columns: 1.6fr 1fr; gap: 12px; margin-bottom: 16px; }
-
-    /* Card container */
-    .card {
-      background: var(--card); border: 1px solid var(--line);
-      border-radius: 12px; padding: 18px;
-    }
-    .card-title {
-      font-size: 14px; font-weight: 600; margin-bottom: 14px;
-      display: flex; justify-content: space-between; align-items: center;
-    }
-    .card-title .badge {
-      font-size: 11px; font-weight: 400; color: var(--text-secondary);
-      background: var(--accent-bg); padding: 2px 8px; border-radius: 999px;
-    }
-
-    /* Chart */
-    .chart-wrap { position: relative; }
-    .chart-y-label {
-      position: absolute; left: 0; top: 0; bottom: 28px;
-      display: flex; flex-direction: column; justify-content: space-between;
-      font-size: 10px; color: var(--text-muted); width: 40px; text-align: right;
-      padding-right: 8px;
-    }
-    .chart-area {
-      margin-left: 48px; height: 200px;
-      display: flex; align-items: flex-end; gap: 3px;
-    }
-    .col-wrap { flex: 1; min-width: 6px; display: flex; flex-direction: column; align-items: center; cursor: pointer; position: relative; }
-    .col-stack { width: 100%; border-radius: 3px 3px 0 0; display: flex; flex-direction: column; min-height: 2px; transition: opacity .15s; }
-    .col-stack:hover { opacity: 0.8; }
-    .col-stack .i { background: var(--input-color); }
-    .col-stack .o { background: var(--output-color); }
-    .col-label { font-size: 9px; color: var(--text-muted); margin-top: 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 40px; }
-    .col-tooltip {
-      position: absolute; bottom: 100%; left: 50%; transform: translateX(-50%);
-      background: #1c202b; border: 1px solid var(--line-hover); border-radius: 8px;
-      padding: 8px 12px; font-size: 12px; white-space: nowrap; z-index: 10;
-      pointer-events: none; opacity: 0; transition: opacity .15s; margin-bottom: 6px;
-    }
-    .col-wrap:hover .col-tooltip { opacity: 1; }
-
-    /* Model table */
-    .model-list { display: flex; flex-direction: column; gap: 10px; }
-    .model-row { }
-    .model-row .top {
-      display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;
-    }
-    .model-row .top .name { font-size: 13px; font-weight: 500; }
-    .model-row .top .tokens { font-size: 12px; color: var(--text-secondary); }
-    .model-bar-wrap {
-      height: 6px; background: rgba(255,255,255,0.05); border-radius: 3px; overflow: hidden;
-      display: flex; gap: 1px;
-    }
-    .model-bar-wrap .i { background: var(--input-color); height: 100%; }
-    .model-bar-wrap .o { background: var(--output-color); height: 100%; }
-    .model-row .cost-row {
-      display: flex; justify-content: space-between; font-size: 11px; color: var(--text-muted); margin-top: 3px;
-    }
-
-    /* Table */
-    .table-wrap { overflow-x: auto; }
-    table { width: 100%; border-collapse: collapse; font-size: 13px; }
-    th { text-align: left; padding: 8px 6px; color: var(--text-secondary); font-weight: 500; font-size: 11px; text-transform: uppercase; letter-spacing: 0.03em; border-bottom: 1px solid var(--line); }
-    td { padding: 8px 6px; border-bottom: 1px solid rgba(38,42,53,0.5); white-space: nowrap; }
-    tr:hover td { background: rgba(255,255,255,0.02); }
-    .status-code { display: inline-flex; align-items: center; gap: 4px; }
-    .dot-ok { display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: var(--green); }
-    .dot-err { display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: var(--red); }
-    .model-tag {
-      display: inline-block; font-size: 11px; padding: 1px 8px; border-radius: 999px;
-      background: var(--accent-bg); color: var(--accent);
-    }
-
-    /* Export tab */
-    .export-actions { display: flex; gap: 8px; align-items: center; margin-bottom: 16px; flex-wrap: wrap; }
-    .btn-primary {
-      background: var(--accent); color: #fff; border: none;
-      border-radius: 8px; padding: 8px 20px; font-size: 13px; font-weight: 500;
-      cursor: pointer; font-family: var(--font); transition: opacity .15s;
-    }
-    .btn-primary:hover { opacity: 0.85; }
-    .btn-primary:disabled { opacity: 0.4; cursor: not-allowed; }
-    .btn-sm {
-      background: var(--card); color: var(--accent); border: 1px solid var(--line);
-      border-radius: 6px; padding: 4px 14px; font-size: 12px;
-      cursor: pointer; font-family: var(--font); transition: all .15s;
-    }
-    .btn-sm:hover { background: var(--accent-bg); border-color: var(--accent); }
-    .btn-sm:disabled { opacity: 0.4; cursor: not-allowed; }
-    .btn-sm.download { color: var(--green); }
-    .btn-sm.download:hover { background: var(--green-bg); border-color: var(--green); }
-    .tag {
-      display: inline-block; font-size: 11px; padding: 2px 10px; border-radius: 999px;
-      font-weight: 500;
-    }
-    .tag.exported { background: var(--green-bg); color: var(--green); }
-    .tag.pending { background: var(--orange-bg); color: var(--orange); }
-    .tag.empty { background: rgba(255,255,255,0.05); color: var(--text-muted); }
-    .spin {
-      display: inline-block; width: 14px; height: 14px;
-      border: 2px solid var(--text-muted); border-top-color: var(--accent);
-      border-radius: 50%; animation: spin .6s linear infinite; vertical-align: middle;
-    }
-    @keyframes spin { to { transform: rotate(360deg); } }
-    .toast {
-      position: fixed; top: 20px; right: 20px; z-index: 999;
-      padding: 12px 20px; border-radius: 10px; font-size: 13px;
-      max-width: 400px; animation: fadeIn .2s;
-    }
-    .toast.success { background: #065f46; color: var(--green); border: 1px solid var(--green); }
-    .toast.error { background: #7f1d1d; color: var(--red); border: 1px solid var(--red); }
-    @keyframes fadeIn { from { opacity: 0; transform: translateY(-8px); } to { opacity: 1; transform: translateY(0); } }
-
-    /* Responsive */
-    @media (max-width: 880px) {
-      .summary-grid { grid-template-columns: repeat(2, 1fr); }
-      .two-col { grid-template-columns: 1fr; }
-    }
-    @media (max-width: 500px) {
-      .summary-grid { grid-template-columns: 1fr; }
-      .app { padding: 16px 12px; }
-    }
-
-    /* Loading shimmer */
-    .shimmer { position: relative; overflow: hidden; }
-    .shimmer::after {
-      content: ''; position: absolute; inset: 0;
-      background: linear-gradient(90deg, transparent, rgba(255,255,255,0.03), transparent);
-      animation: shimmer 2s infinite;
-    }
-    @keyframes shimmer { 0% { transform: translateX(-100%); } 100% { transform: translateX(100%); } }
-    .empty-state { text-align: center; padding: 40px 20px; color: var(--text-muted); font-size: 14px; }
-
-    /* Prompt list */
-    .prompt-preview {
-      max-width: 480px;
-      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-      color: var(--text-secondary); font-size: 13px; line-height: 1.4;
-    }
-    .prompt-full {
-      max-width: 600px;
-      white-space: pre-wrap; word-break: break-word;
-      font-size: 13px; line-height: 1.6; color: var(--text);
-      padding: 8px 0;
-    }
-    .pagination {
-      display: flex; justify-content: center; align-items: center; gap: 12px;
-      margin-top: 16px; padding-top: 12px;
-      border-top: 1px solid var(--line);
-    }
-    .page-info {
-      font-size: 13px; color: var(--text-secondary);
-      min-width: 60px; text-align: center;
-    }
-    tr.prompt-row { cursor: pointer; }
-    tr.prompt-row:hover { background: rgba(108,140,255,0.04); }
-
-    /* Prompts tab layout */
-    .prompts-layout { display: grid; grid-template-columns: 220px 1fr; gap: 16px; align-items: start; }
-    .prompts-sidebar { position: sticky; top: 0; }
-    .prompts-main { min-width: 0; }
-
-    /* Date tree */
-    .date-month { margin-bottom: 2px; }
-    .date-month-header {
-      display: flex; align-items: center; gap: 6px; padding: 8px 10px;
-      cursor: pointer; border-radius: 4px; font-size: 13px; font-weight: 500;
-      color: var(--text); user-select: none;
-    }
-    .date-month-header:hover { background: var(--line); }
-    .date-month-arrow { font-size: 10px; width: 12px; color: var(--text-muted); }
-    .date-day-list { padding-left: 18px; }
-    .date-day-item {
-      display: flex; align-items: center; justify-content: space-between;
-      padding: 6px 10px; border-radius: 4px; cursor: pointer;
-      font-size: 13px; color: var(--text-secondary);
-    }
-    .date-day-item:hover { background: var(--line); color: var(--text); }
-    .date-day-item.active { background: rgba(108,140,255,0.15); color: var(--accent); font-weight: 500; }
-
-    /* QA Cards */
-    .qa-card {
-      background: var(--card); border: 1px solid var(--line);
-      border-radius: 8px; margin-bottom: 12px; overflow: hidden;
-    }
-    .qa-question { padding: 12px 16px; cursor: pointer; }
-    .qa-question:hover { background: rgba(108,140,255,0.02); }
-    .qa-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
-    .qa-meta { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-    .qa-time { font-size: 12px; color: var(--text-muted); }
-    .qa-prompt { display: flex; gap: 8px; align-items: flex-start; }
-    .qa-label {
-      flex-shrink: 0; width: 22px; height: 22px; border-radius: 4px;
-      background: var(--accent); color: #fff; font-size: 12px; font-weight: 700;
-      display: flex; align-items: center; justify-content: center;
-    }
-
-    /* Answer section */
-    .qa-answer { border-top: 1px solid var(--line); }
-    .qa-thinking { background: rgba(167,139,250,0.06); padding: 12px 16px; }
-    .qa-thinking-header {
-      display: flex; align-items: center; gap: 6px; margin-bottom: 8px;
-      font-size: 12px; font-weight: 600; color: var(--output-color); text-transform: uppercase; letter-spacing: 0.5px;
-    }
-    .qa-thinking-icon, .qa-solution-icon { font-size: 14px; }
-    .qa-thinking-body {
-      font-size: 13px; line-height: 1.7; color: var(--text-secondary);
-      white-space: pre-wrap; word-break: break-word;
-      max-height: 400px; overflow-y: auto;
-      font-family: 'SF Mono', 'Fira Code', monospace; font-size: 12px;
-    }
-    .qa-solution { padding: 12px 16px; background: rgba(108,140,255,0.03); }
-    .qa-solution-header {
-      display: flex; align-items: center; gap: 6px; margin-bottom: 8px;
-      font-size: 12px; font-weight: 600; color: var(--accent); text-transform: uppercase; letter-spacing: 0.5px;
-    }
-    .qa-solution-body {
-      font-size: 13px; line-height: 1.7; color: var(--text);
-      white-space: pre-wrap; word-break: break-word;
-      max-height: 500px; overflow-y: auto;
-    }
-
-    @media (max-width: 768px) {
-      .prompts-layout { grid-template-columns: 1fr; }
-      .prompts-sidebar { position: static; }
-    }
-
-    /* Agent chat tab */
-    .agent-layout {
-      display: flex; flex-direction: column; height: calc(100vh - 180px); min-height: 500px;
-    }
-    .agent-topbar {
-      display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
-      padding: 10px 14px; background: var(--card); border: 1px solid var(--line);
-      border-radius: 10px; margin-bottom: 12px;
-    }
-    .agent-topbar select {
-      background: var(--card); color: var(--text); border: 1px solid var(--line);
-      border-radius: 6px; padding: 5px 10px; font-size: 13px; cursor: pointer; font-family: var(--font);
-    }
-    .tool-toggle {
-      display: flex; align-items: center; gap: 4px; font-size: 12px;
-      color: var(--text-secondary); cursor: pointer; user-select: none;
-    }
-    .tool-toggle input { accent-color: var(--accent); }
-
-    .agent-chat {
-      flex: 1; overflow-y: auto; padding: 8px 4px;
-      display: flex; flex-direction: column; gap: 8px;
-    }
-    .agent-msg { display: flex; flex-direction: column; }
-    .agent-msg.user { align-items: flex-end; }
-    .agent-msg.assistant, .agent-msg.response { align-items: flex-start; }
-
-    .agent-bubble {
-      max-width: 80%; padding: 10px 14px; border-radius: 10px;
-      font-size: 13px; line-height: 1.6; white-space: pre-wrap; word-break: break-word;
-    }
-    .agent-bubble.user {
-      background: var(--accent); color: #fff; border-bottom-right-radius: 2px;
-    }
-    .agent-bubble.assistant {
-      background: var(--card); color: var(--text); border: 1px solid var(--line);
-      border-bottom-left-radius: 2px;
-    }
-    .agent-bubble.error {
-      background: var(--red-bg); color: var(--red); border: 1px solid rgba(239,68,68,0.3);
-      max-width: 90%; font-size: 12px;
-    }
-
-    .agent-thinking-box {
-      background: rgba(167,139,250,0.06); border-left: 3px solid var(--output-color);
-      border-radius: 0 8px 8px 0; margin: 2px 0; overflow: hidden;
-    }
-    .think-header {
-      display: flex; align-items: center; gap: 6px; padding: 8px 12px;
-      font-size: 12px; font-weight: 600; color: var(--output-color);
-      cursor: pointer; user-select: none; text-transform: uppercase; letter-spacing: 0.3px;
-    }
-    .think-header:hover { background: rgba(167,139,250,0.04); }
-    .think-body {
-      padding: 0 12px 10px; font-size: 12px; line-height: 1.6;
-      color: var(--text-secondary); white-space: pre-wrap; word-break: break-word;
-      font-family: 'SF Mono', 'Fira Code', monospace;
-      border-top: 1px solid rgba(167,139,250,0.08);
-    }
-
-    .agent-action-card {
-      background: rgba(245,158,11,0.08); border: 1px solid rgba(245,158,11,0.2);
-      border-radius: 8px; padding: 8px 12px; margin: 2px 0;
-      font-size: 12px; color: var(--orange); font-family: 'SF Mono', 'Fira Code', monospace;
-    }
-
-    .agent-obs-box {
-      background: rgba(255,255,255,0.02); border-left: 3px solid var(--text-muted);
-      border-radius: 0 8px 8px 0; margin: 2px 0; overflow: hidden;
-    }
-    .obs-header {
-      display: flex; align-items: center; gap: 6px; padding: 8px 12px;
-      font-size: 12px; font-weight: 600; color: var(--text-secondary);
-      cursor: pointer; user-select: none; text-transform: uppercase; letter-spacing: 0.3px;
-    }
-    .obs-header:hover { background: rgba(255,255,255,0.02); }
-    .obs-body {
-      padding: 0 12px 10px; margin: 0; font-size: 11px; line-height: 1.5;
-      color: var(--text-muted); white-space: pre-wrap; word-break: break-word;
-      font-family: 'SF Mono', 'Fira Code', monospace;
-      border-top: 1px solid rgba(255,255,255,0.04);
-      max-height: 300px; overflow-y: auto;
-    }
-
-    .agent-input-area {
-      display: flex; gap: 10px; align-items: flex-end; margin-top: 12px;
-      padding: 12px 14px; background: var(--card); border: 1px solid var(--line);
-      border-radius: 10px;
-    }
-    .agent-input-area textarea {
-      flex: 1; background: var(--bg); color: var(--text); border: 1px solid var(--line);
-      border-radius: 8px; padding: 10px 12px; font-size: 13px; line-height: 1.5;
-      font-family: var(--font); resize: none; outline: none;
-    }
-    .agent-input-area textarea:focus { border-color: var(--accent); }
-    .agent-input-area textarea::placeholder { color: var(--text-muted); }
-    .agent-input-area .btn-primary { padding: 10px 24px; font-size: 14px; }
-
-    .agent-loading {
-      display: flex; align-items: center; gap: 8px; padding: 8px 12px;
-      color: var(--text-muted); font-size: 13px;
-    }
-    .dots::after {
-      content: ''; animation: dots 1.5s steps(4, end) infinite;
-    }
-    @keyframes dots {
-      0% { content: ''; } 25% { content: '.'; } 50% { content: '..'; } 75% { content: '...'; } 100% { content: ''; }
-    }
-
-    @media (max-width: 768px) {
-      .agent-layout { height: calc(100vh - 200px); }
-      .agent-bubble { max-width: 92%; }
-      .agent-topbar { gap: 6px; padding: 8px 10px; }
-      .agent-topbar select { font-size: 12px; padding: 4px 8px; }
-    }
-  </style>
 </head>
 <body>
   <div id="app" class="app">
@@ -495,7 +45,6 @@
 
     <!-- ============ USAGE TAB ============ -->
     <template v-if="activeTab === 'usage'">
-      <!-- Loading skeleton -->
       <template v-if="loading && !summary.total_requests">
         <div class="summary-grid">
           <div v-for="n in 4" class="summary-card shimmer" style="height:88px"></div>
@@ -504,7 +53,6 @@
       </template>
 
       <template v-else>
-        <!-- Summary Cards -->
         <div class="summary-grid">
           <div class="summary-card">
             <div class="label">Total Cost</div>
@@ -540,7 +88,6 @@
           </div>
         </div>
 
-        <!-- Two Column: Chart + Models -->
         <div class="two-col">
           <div class="card">
             <div class="card-title">
@@ -604,7 +151,6 @@
           </div>
         </div>
 
-        <!-- Recent Requests -->
         <div class="card">
           <div class="card-title">
             <span>Recent Requests</span>
@@ -717,117 +263,97 @@
       </div>
     </template>
 
-    <!-- ============ PROMPTS TAB ============ -->
+    <!-- ============ PROMPTS TAB (DeepSeek Style) ============ -->
     <template v-if="activeTab === 'prompts'">
-      <div class="prompts-layout">
-        <!-- Left: date tree -->
-        <div class="prompts-sidebar">
-          <div class="card" style="margin:0;">
-            <div class="card-title">
-              <span>数据日期</span>
-              <button class="btn-sm" @click="loadPromptDates" :disabled="datesLoading" style="margin-left:auto;">
-                <span v-if="datesLoading" class="spin" style="width:10px;height:10px;"></span>
-                ↻
-              </button>
-            </div>
-            <template v-if="datesLoading && promptMonths.length === 0">
+      <div class="conv-layout">
+        <!-- Left: Conversation list sidebar -->
+        <div class="conv-sidebar">
+          <div class="conv-sidebar-header">
+            <span class="title">对话列表</span>
+            <button class="btn-sm" @click="loadConversations" :disabled="convLoading" style="margin-left:auto;">刷新</button>
+          </div>
+          <div class="conv-list">
+            <template v-if="convLoading && convGroups.length === 0">
               <div class="shimmer" style="height:200px;"></div>
             </template>
-            <template v-else-if="promptMonths.length === 0">
-              <div class="empty-state" style="padding:20px;">暂无数据</div>
+            <template v-else-if="convGroups.length === 0">
+              <div class="empty-state" style="padding:30px 20px;font-size:12px;">暂无对话数据</div>
             </template>
             <template v-else>
-              <div v-for="m in promptMonths" :key="m.month" class="date-month">
-                <div class="date-month-header" @click="toggleMonth(m.month)">
-                  <span class="date-month-arrow">{{ expandedMonths[m.month] ? '▾' : '▸' }}</span>
-                  <span>{{ fmtMonth(m.month) }}</span>
-                  <span class="badge" style="margin-left:auto;">{{ monthTotal(m) }}</span>
-                </div>
-                <div v-if="expandedMonths[m.month]" class="date-day-list">
-                  <div v-for="d in m.days" :key="d.date"
-                    :class="['date-day-item', { active: selectedDate === d.date }]"
-                    @click="selectDate(d.date)">
-                    <span>{{ fmtDay(d.date) }}</span>
-                    <span class="badge">{{ d.count }}</span>
+              <template v-for="group in convGroups" :key="group.label + group.date">
+                <div class="conv-group-header">{{ group.label }}</div>
+                <div v-for="conv in group.conversations" :key="conv.id"
+                  :class="['conv-item', { active: selectedConvId === conv.id }]"
+                  @click="selectConversation(conv.id)">
+                  <div class="conv-item-title">{{ conv.title || '(无标题)' }}</div>
+                  <div class="conv-item-meta">
+                    <span>{{ fmtDateShort(conv.timestamp) }}</span>
+                    <span class="conv-item-model">{{ shortModel(conv.model) }}</span>
+                    <span class="conv-item-badge">{{ conv.turn_count }} 轮</span>
                   </div>
                 </div>
-              </div>
+              </template>
             </template>
           </div>
         </div>
 
-        <!-- Right: prompt cards -->
-        <div class="prompts-main">
-          <template v-if="!selectedDate">
-            <div class="card" style="text-align:center;padding:80px 20px;color:var(--text-muted);">
-              <div style="font-size:48px;margin-bottom:16px;">📋</div>
-              <div>选择左侧日期查看当天提示词与回复</div>
+        <!-- Right: Chat-style message display -->
+        <div class="conv-chat">
+          <template v-if="!selectedConvId">
+            <div class="conv-empty">
+              <div>
+                <div class="conv-empty-icon">💬</div>
+                <div>选择左侧对话查看详情</div>
+              </div>
             </div>
           </template>
           <template v-else>
-            <template v-if="promptsLoading && prompts.items.length === 0">
-              <div class="card shimmer" style="height:400px;"></div>
-            </template>
-            <template v-else>
-              <!-- Prompt + Response Cards -->
-              <div v-for="item in prompts.items" :key="item.id" class="qa-card">
-                <!-- Question -->
-                <div class="qa-question" @click="toggleExpand(item.id)">
-                  <div class="qa-header">
-                    <div class="qa-meta">
-                      <span class="qa-time">{{ fmtTime(item.timestamp) }}</span>
-                      <span class="model-tag">{{ shortModel(item.model) }}</span>
-                      <span class="tag">{{ item.language }}</span>
-                      <span style="font-size:12px;color:var(--text-muted);">{{ fmtInt(item.total_tokens) }} tokens</span>
-                    </div>
-                    <span style="color:var(--text-muted);font-size:12px;">{{ expandedId === item.id ? '收起 ▴' : '展开 ▾' }}</span>
+            <div class="conv-chat-header">
+              <div class="conv-item-title" style="font-size:15px;font-weight:600;margin-bottom:2px;">{{ selectedConv?.title || '(无标题)' }}</div>
+              <div class="conv-subtitle">{{ shortModel(selectedConv?.model) }} · {{ selectedConv?.turn_count || 0 }} 轮 · {{ fmtDateShort(selectedConv?.timestamp) }}</div>
+            </div>
+
+            <div v-if="convDetailLoading" class="conv-loading">
+              <span class="spin" style="width:18px;height:18px;margin-right:10px;"></span> 加载中...
+            </div>
+
+            <div v-else-if="selectedConv?.turns" class="conv-messages" ref="convMessages">
+              <template v-for="(turn, idx) in selectedConv.turns" :key="turn.turn_index">
+                <!-- User message -->
+                <div class="msg-row user">
+                  <div class="msg-meta">
+                    <span>{{ fmtTime(turn.timestamp) }}</span>
+                    <span class="conv-item-model" style="font-size:10px;">{{ shortModel(turn.model) }}</span>
+                    <span style="color:var(--text-muted);">{{ fmtInt(turn.total_tokens) }} tokens</span>
                   </div>
-                  <div class="qa-prompt">
-                    <span class="qa-label">Q</span>
-                    <span v-if="expandedId !== item.id" class="prompt-preview">{{ item.prompt_preview }}</span>
-                    <span v-else class="prompt-full">{{ item.prompt_full }}</span>
-                  </div>
+                  <div class="msg-bubble user">{{ turn.user_message }}</div>
                 </div>
 
-                <!-- Answer (visible when expanded) -->
-                <div v-if="expandedId === item.id" class="qa-answer">
-                  <!-- Thinking process -->
-                  <div v-if="hasThinking(item)" class="qa-thinking">
-                    <div class="qa-thinking-header">
-                      <span class="qa-thinking-icon">🧠</span>
+                <!-- Thinking (collapsible) -->
+                <div v-if="turn.thinking" class="msg-row assistant">
+                  <div class="think-block">
+                    <div class="think-block-header" @click="toggleThinking(turn.turn_index)">
+                      <span class="think-icon">🧠</span>
                       <span>思考过程</span>
+                      <span class="think-arrow">{{ collapsedThinking[turn.turn_index] ? '▸' : '▾' }}</span>
                     </div>
-                    <div class="qa-thinking-body">{{ extractThinking(item) }}</div>
-                  </div>
-                  <!-- Response -->
-                  <div v-if="hasSolution(item)" class="qa-solution">
-                    <div class="qa-solution-header">
-                      <span class="qa-solution-icon">💬</span>
-                      <span>模型回复</span>
-                    </div>
-                    <div class="qa-solution-body">{{ extractSolution(item) }}</div>
-                  </div>
-                  <!-- No response at all -->
-                  <div v-if="!hasThinking(item) && !hasSolution(item)" class="qa-thinking" style="color:var(--text-muted);text-align:center;padding:16px;">
-                    无回复内容
+                    <div v-if="!collapsedThinking[turn.turn_index]" class="think-block-body">{{ turn.thinking }}</div>
                   </div>
                 </div>
-              </div>
 
-              <div v-if="prompts.items.length === 0" class="card">
-                <div class="empty-state">当天暂无有效提示词数据</div>
-              </div>
+                <!-- Assistant response -->
+                <div v-if="turn.response" class="msg-row assistant">
+                  <div class="msg-bubble-wrap">
+                    <button class="msg-copy-btn" @click="copyText(turn.response)">复制</button>
+                    <div class="msg-bubble assistant">{{ turn.response }}</div>
+                  </div>
+                </div>
 
-              <!-- Pagination -->
-              <div class="pagination" v-if="prompts.total_pages > 1">
-                <button class="btn-sm" :disabled="prompts.page <= 1" @click="goPromptPage(prompts.page - 1)">上一页</button>
-                <span class="page-info">{{ prompts.page }} / {{ prompts.total_pages }}</span>
-                <button class="btn-sm" :disabled="prompts.page >= prompts.total_pages" @click="goPromptPage(prompts.page + 1)">下一页</button>
-                <span style="margin-left:8px">跳转</span>
-                <input class="page-jump" v-model="jumpPage" @keyup.enter="jumpToPage" placeholder="页" style="width:45px;text-align:center">
-                <button class="btn-sm" @click="jumpToPage">GO</button>
-              </div>
-            </template>
+                <!-- Divider between turns -->
+                <div v-if="idx < selectedConv.turns.length - 1"
+                  style="border-top:1px solid var(--line);margin:4px 0;opacity:0.3;"></div>
+              </template>
+            </div>
           </template>
         </div>
       </div>
@@ -859,10 +385,8 @@
           </template>
 
           <div v-for="(msg, idx) in agentMessages" :key="idx" :class="['agent-msg', msg.role]">
-            <!-- User message -->
             <div v-if="msg.role === 'user'" class="agent-bubble user">{{ msg.content }}</div>
 
-            <!-- Thinking -->
             <div v-if="msg.role === 'thinking'" class="agent-thinking-box">
               <div class="think-header" @click="msg.collapsed = !msg.collapsed">
                 <span>🧠 思考 #{{ msg.iteration }}</span>
@@ -871,13 +395,11 @@
               <div v-if="!msg.collapsed" class="think-body">{{ msg.content }}</div>
             </div>
 
-            <!-- Action -->
             <div v-if="msg.role === 'action'" class="agent-action-card">
               <div>🔧 <strong>{{ msg.tool }}</strong> {{ msg.args }}</div>
               <div style="color:var(--text-muted);font-size:11px;margin-top:2px;">{{ msg.descriptor }}</div>
             </div>
 
-            <!-- Observation -->
             <div v-if="msg.role === 'observation'" class="agent-obs-box">
               <div class="obs-header" @click="msg.collapsed = !msg.collapsed">
                 <span>📋 观测结果 #{{ msg.iteration }}</span>
@@ -886,14 +408,10 @@
               <pre v-if="!msg.collapsed" class="obs-body">{{ msg.content }}</pre>
             </div>
 
-            <!-- Final response -->
             <div v-if="msg.role === 'response'" class="agent-bubble assistant">{{ msg.content }}</div>
-
-            <!-- Error -->
             <div v-if="msg.role === 'error'" class="agent-bubble error">❌ {{ msg.content }}</div>
           </div>
 
-          <!-- Loading indicator -->
           <div v-if="agentLoading" class="agent-loading">
             <span class="spin" style="width:12px;height:12px;"></span>
             <span>Agent 思考中</span><span class="dots"></span>
@@ -912,373 +430,6 @@
     <div v-if="toast.show" :class="['toast', toast.type]">{{ toast.message }}</div>
   </div>
 
-  <script>
-    const { createApp } = Vue;
-
-    createApp({
-      data() {
-        return {
-          activeTab: 'usage',
-          // Usage tab state
-          days: 30, streamMode: true, autoRefresh: true, refreshSeconds: 5,
-          refreshTimerId: null, stream: null, loading: false,
-          summary: {
-            total_tokens: 0, total_requests: 0, success_requests: 0, success_rate: 0,
-            estimated_cost_usd: 0, prompt_tokens: 0, completion_tokens: 0,
-            avg_latency_ms: 0, generated_at: "", daily: [], by_model: [], recent: [],
-          },
-          // Export tab state
-          exportFormat: 'reasoning',
-          exportDates: [], exportLoading: false,
-          uploadingToMS: false, uploadingToHF: false,
-          // Prompts tab state
-          promptMonths: [], datesLoading: false, expandedMonths: {},
-          selectedDate: null,
-          promptsLoading: false,
-          prompts: { items: [], total: 0, page: 1, per_page: 20, total_pages: 0 },
-          promptsPage: 1, expandedId: null, jumpPage: '',
-          toast: { show: false, message: '', type: 'success' },
-          // Agent tab state
-          agentModel: '', agentModels: [],
-          agentTools: { bash: true, read_file: true, write_file: true, grep: true, glob: true },
-          agentMessages: [], agentInput: '', agentLoading: false,
-        };
-      },
-      computed: {
-        chartData() {
-          const daily = this.summary.daily || [];
-          const max = daily.reduce((m, p) => Math.max(m, p.total_tokens || 0, 1), 1);
-          return daily.map((p) => {
-            const total = p.total_tokens || 1;
-            return {
-              ...p, height: Math.max(2, (p.total_tokens / max) * 100),
-              prompt_ratio: p.prompt_tokens / total, completion_ratio: p.completion_tokens / total,
-              shortDate: (p.date || "").slice(5), dateLabel: p.date || "",
-            };
-          });
-        },
-        chartMax() {
-          return (this.summary.daily || []).reduce((m, p) => Math.max(m, p.total_tokens || 0), 0) || 1;
-        },
-      },
-      methods: {
-        Math: window.Math,
-        fmtInt(v) { return Number(v || 0).toLocaleString("zh-CN"); },
-        fmtCost(v) { const n = Number(v || 0); if (n < 0.01) return n.toFixed(4); if (n < 1) return n.toFixed(3); return n.toFixed(2); },
-        fmtLatency(ms) { const n = Number(ms || 0); return n < 1000 ? n + 'ms' : (n / 1000).toFixed(1) + 's'; },
-        fmtTime(ts) {
-          if (!ts) return '-';
-          const d = new Date(ts), pad = (n) => String(n).padStart(2, '0');
-          return pad(d.getMonth()+1) + '/' + pad(d.getDate()) + ' ' + pad(d.getHours()) + ':' + pad(d.getMinutes());
-        },
-        timeAgo(ts) {
-          if (!ts) return '-';
-          const diff = Date.now() - new Date(ts).getTime(), sec = Math.floor(diff / 1000);
-          if (sec < 60) return sec + 's ago'; if (sec < 3600) return Math.floor(sec/60) + 'm ago';
-          if (sec < 86400) return Math.floor(sec/3600) + 'h ago'; return Math.floor(sec/86400) + 'd ago';
-        },
-        shortModel(m) { if (!m) return 'unknown'; return m.replace(/^claude-/, 'claude.').replace(/^gpt-/, 'gpt.'); },
-        shortEndpoint(e) { if (!e) return '-'; const parts = e.split('/'); return parts[parts.length-1] || e; },
-        ratio(a, b) { if (!b) return 0; return Math.round((a / b) * 100); },
-        fmtExportDate(d) { if (!d || d.length !== 8) return d; return d.slice(0,4) + '-' + d.slice(4,6) + '-' + d.slice(6,8); },
-
-        // === Usage tab ===
-        async load() {
-          this.loading = true;
-          try {
-            const res = await fetch(`/api/usage/summary?days=${this.days}&t=${Date.now()}`, { cache: "no-store" });
-            if (!res.ok) throw new Error("Failed to fetch usage data");
-            this.summary = await res.json();
-          } catch (err) { console.error(err); }
-          finally { this.loading = false; }
-        },
-        startAutoRefresh() { if (this.streamMode) return; this.stopAutoRefresh(); this.refreshTimerId = setInterval(() => this.load().catch(console.error), this.refreshSeconds * 1000); },
-        stopAutoRefresh() { if (this.refreshTimerId) { clearInterval(this.refreshTimerId); this.refreshTimerId = null; } },
-        startStream() {
-          this.stopStream();
-          const es = new EventSource(`/api/usage/stream?days=${this.days}`);
-          es.addEventListener("usage", (evt) => { try { this.summary = JSON.parse(evt.data); } catch (err) { console.error(err); } });
-          es.onerror = () => { this.streamMode = false; this.stopStream(); };
-          this.stream = es;
-        },
-        stopStream() { if (this.stream) { this.stream.close(); this.stream = null; } },
-        toggleStreamMode() { this.streamMode = !this.streamMode; if (this.streamMode) { this.stopAutoRefresh(); this.startStream(); } else { this.stopStream(); this.startAutoRefresh(); } },
-        onDaysChange() { this.load().catch(console.error); if (this.streamMode) { this.stopStream(); this.startStream(); } },
-
-        // === Export tab ===
-        showToast(msg, type) {
-          this.toast = { show: true, message: msg, type: type };
-          setTimeout(() => { this.toast.show = false; }, 3500);
-        },
-        async loadExportDates() {
-          this.exportLoading = true;
-          try {
-            const res = await fetch('/api/export/dates?t=' + Date.now(), { cache: "no-store" });
-            if (!res.ok) throw new Error("Failed to load dates");
-            const data = await res.json();
-            // Preserve exporting state on existing entries
-            const oldMap = {};
-            this.exportDates.forEach(d => { oldMap[d.date] = d.exporting; });
-            this.exportDates = (data.dates || []).map(d => ({ ...d, exporting: !!oldMap[d.date] }));
-          } catch (err) {
-            console.error(err);
-            this.showToast('加载日期列表失败: ' + err.message, 'error');
-          } finally { this.exportLoading = false; }
-        },
-        async triggerExport(d) {
-          d.exporting = true;
-          try {
-            const res = await fetch('/api/export/day?date=' + d.date + '&format=' + this.exportFormat, { method: 'POST', cache: "no-store" });
-            const data = await res.json();
-            if (!res.ok) throw new Error(data.error || 'Export failed');
-            d.exported = true;
-            d.export_file = data.file;
-            this.showToast(d.date + ' 导出完成 — ' + this.fmtInt(data.rows) + ' 条记录', 'success');
-          } catch (err) {
-            console.error(err);
-            this.showToast(d.date + ' 导出失败: ' + err.message, 'error');
-          } finally { d.exporting = false; }
-        },
-        downloadExport(fileName) {
-          window.open('/api/export/download?file=' + encodeURIComponent(fileName), '_blank');
-        },
-        async uploadToModelScope() {
-          this.uploadingToMS = true;
-          try {
-            const res = await fetch('/api/modelscope/upload', { method: 'POST', cache: "no-store" });
-            const data = await res.json();
-            if (res.ok) {
-              this.showToast('ModelScope 上传已触发，后台执行中...', 'success');
-            } else {
-              this.showToast('上传失败: ' + (data.message || data.error || res.statusText), 'error');
-            }
-          } catch (err) {
-            this.showToast('上传请求失败: ' + err.message, 'error');
-          } finally { this.uploadingToMS = false; }
-        },
-        async uploadToHuggingFace() {
-          this.uploadingToHF = true;
-          try {
-            const res = await fetch('/api/huggingface/upload', { method: 'POST', cache: "no-store" });
-            const data = await res.json();
-            if (res.ok) {
-              this.showToast('HuggingFace 上传已触发，后台执行中...', 'success');
-            } else {
-              this.showToast('上传失败: ' + (data.message || data.error || res.statusText), 'error');
-            }
-          } catch (err) {
-            this.showToast('上传请求失败: ' + err.message, 'error');
-          } finally { this.uploadingToHF = false; }
-        },
-
-        // === Prompts tab ===
-        fmtMonth(m) { return m.slice(0,4) + '-' + m.slice(4,6); },
-        fmtDay(d) { return d.slice(4,6) + '/' + d.slice(6,8); },
-        monthTotal(m) { return m.days.reduce((s, d) => s + d.count, 0); },
-        toggleMonth(month) {
-          this.expandedMonths[month] = !this.expandedMonths[month];
-        },
-        async loadPromptDates() {
-          this.datesLoading = true;
-          try {
-            const res = await fetch('/api/prompts/dates?t=' + Date.now(), { cache: "no-store" });
-            if (!res.ok) throw new Error("Failed");
-            const data = await res.json();
-            this.promptMonths = data.months || [];
-            // Auto-expand first month
-            if (this.promptMonths.length > 0) {
-              this.expandedMonths[this.promptMonths[0].month] = true;
-            }
-          } catch (err) {
-            console.error(err);
-          } finally { this.datesLoading = false; }
-        },
-        selectDate(date) {
-          this.selectedDate = date;
-          this.promptsPage = 1;
-          this.expandedId = null;
-          this.loadPrompts();
-        },
-        async loadPrompts() {
-          if (!this.selectedDate) return;
-          this.promptsLoading = true;
-          try {
-            const params = new URLSearchParams({
-              date: this.selectedDate, page: this.promptsPage,
-              per_page: 20, t: Date.now(),
-            });
-            const res = await fetch('/api/prompts?' + params, { cache: "no-store" });
-            if (!res.ok) throw new Error("Failed to fetch prompts");
-            this.prompts = await res.json();
-          } catch (err) {
-            console.error(err);
-            this.showToast('加载提示词失败: ' + err.message, 'error');
-          } finally { this.promptsLoading = false; }
-        },
-        goPromptPage(page) {
-          if (page < 1 || page > this.prompts.total_pages) return;
-          this.promptsPage = page;
-          this.loadPrompts();
-        },
-        toggleExpand(id) { this.expandedId = this.expandedId === id ? null : id; },
-        jumpToPage() {
-          const n = parseInt(this.jumpPage, 10);
-          if (isNaN(n) || n < 1 || n > this.prompts.total_pages) {
-            this.showToast('页码超出范围', 'error');
-            return;
-          }
-          this.goPromptPage(n);
-          this.jumpPage = '';
-        },
-        hasThinking(item) {
-          if (!item.response_full) return false;
-          return item.response_full.startsWith('【思考过程】');
-        },
-        hasSolution(item) {
-          if (!item.response_full) return false;
-          return item.response_full.includes('【回复】');
-        },
-        extractThinking(item) {
-          const text = item.response_full || '';
-          const idx = text.indexOf('【回复】');
-          if (idx > 0) return text.substring('【思考过程】\n'.length, idx).trim();
-          if (text.startsWith('【思考过程】\n')) return text.substring('【思考过程】\n'.length).trim();
-          return text;
-        },
-        extractSolution(item) {
-          const text = item.response_full || '';
-          const idx = text.indexOf('【回复】\n');
-          if (idx > 0) return text.substring(idx + '【回复】\n'.length).trim();
-          if (!text.startsWith('【思考过程】')) return text;
-          return '';
-        },
-
-        // === Agent tab ===
-        initAgentModels() {
-          // Extract model names from the model tags in the prompts list, or use a default
-          fetch('/v1/models?t=' + Date.now(), { cache: "no-store" })
-            .then(r => r.json())
-            .then(data => {
-              const models = data.data || data.models || [];
-              this.agentModels = models.map(m => typeof m === 'string' ? m : (m.id || m.name || '')).filter(Boolean);
-              if (this.agentModels.length > 0 && !this.agentModel) this.agentModel = this.agentModels[0];
-            })
-            .catch(() => {
-              this.agentModels = ['DeepSeekV4'];
-              if (!this.agentModel) this.agentModel = 'DeepSeekV4';
-            });
-        },
-        clearAgentChat() { this.agentMessages = []; },
-        scrollAgentToBottom() {
-          this.$nextTick(() => {
-            const el = this.$refs.agentChat;
-            if (el) el.scrollTop = el.scrollHeight;
-          });
-        },
-        async sendAgentMessage() {
-          const msg = this.agentInput.trim();
-          if (!msg || this.agentLoading) return;
-          if (!this.agentModel) {
-            this.showToast('请先选择模型', 'error');
-            return;
-          }
-          const enabledTools = Object.entries(this.agentTools).filter(([, v]) => v).map(([k]) => k);
-          if (enabledTools.length === 0) {
-            this.showToast('请至少启用一个工具', 'error');
-            return;
-          }
-
-          this.agentMessages.push({ role: 'user', content: msg });
-          this.agentInput = '';
-          this.agentLoading = true;
-          this.scrollAgentToBottom();
-
-          try {
-            const res = await fetch('/api/chat/agent', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ model: this.agentModel, message: msg, tools: enabledTools }),
-            });
-
-            if (!res.ok) {
-              const errText = await res.text();
-              this.agentMessages.push({ role: 'error', content: '请求失败: ' + (errText || res.statusText) });
-              this.agentLoading = false;
-              return;
-            }
-
-            const reader = res.body.getReader();
-            const decoder = new TextDecoder();
-            let buf = '';
-
-            while (true) {
-              const { done, value } = await reader.read();
-              if (done) break;
-              buf += decoder.decode(value, { stream: true });
-
-              // Parse SSE events
-              const lines = buf.split('\n');
-              buf = '';
-              let eventType = '';
-              for (let i = 0; i < lines.length; i++) {
-                const line = lines[i];
-                if (line.startsWith('event: ')) {
-                  eventType = line.slice(7).trim();
-                } else if (line.startsWith('data: ')) {
-                  const dataStr = line.slice(6);
-                  try {
-                    const data = JSON.parse(dataStr);
-                    switch (eventType) {
-                      case 'thinking':
-                        this.agentMessages.push({ role: 'thinking', iteration: data.iteration, content: data.thought, collapsed: false });
-                        break;
-                      case 'action':
-                        this.agentMessages.push({ role: 'action', iteration: data.iteration, tool: data.tool, args: data.arguments, descriptor: data.descriptor });
-                        break;
-                      case 'observation':
-                        this.agentMessages.push({ role: 'observation', iteration: data.iteration, content: data.result, collapsed: true });
-                        break;
-                      case 'response':
-                        this.agentMessages.push({ role: 'response', content: data.content });
-                        break;
-                      case 'done':
-                        // nothing to add, just cleanup
-                        break;
-                      case 'error':
-                        this.agentMessages.push({ role: 'error', content: data.message });
-                        break;
-                    }
-                  } catch (e) {
-                    // Partial data — put back in buffer
-                    buf = line + '\n' + lines.slice(i + 1).join('\n');
-                    i = lines.length;
-                  }
-                  eventType = '';
-                } else if (line.trim() !== '') {
-                  buf += line + '\n';
-                }
-              }
-              this.scrollAgentToBottom();
-            }
-          } catch (err) {
-            console.error('Agent chat error:', err);
-            this.agentMessages.push({ role: 'error', content: '连接失败: ' + err.message });
-          } finally {
-            this.agentLoading = false;
-            this.scrollAgentToBottom();
-          }
-        },
-      },
-      mounted() {
-        this.load();
-        if (this.streamMode) this.startStream();
-        else this.startAutoRefresh();
-      },
-      beforeUnmount() {
-        this.stopAutoRefresh();
-        this.stopStream();
-      },
-    }).mount("#app");
-  </script>
+  <script src="/static/js/app.js"></script>
 </body>
 </html>

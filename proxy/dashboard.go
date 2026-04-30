@@ -34,31 +34,50 @@ package proxy
 
 import (
 	"embed"
+	"io/fs"
 	"net/http"
 )
 
 /*
  * @brief 内嵌的 Usage Dashboard 前端文件系统
  *
- * 通过 go:embed 指令，在编译时将 web/usage.html 打包进二进制文件。
- * 该文件包含完整的 Vue 3 单页应用，使用 Chart.js 绘制用量趋势图，
- * 通过 EventSource API 连接到 /api/usage/stream 获取实时 SSE 数据流。
+ * 通过 go:embed 指令，在编译时将 web/ 目录下所有文件打包进二进制文件。
+ * 包含以下前端资源：
+ *   - web/usage.html — 主 HTML 页面
+ *   - web/css/style.css — 样式表
+ *   - web/js/app.js — Vue 3 应用代码
  *
- * @note 编译时要求 web/usage.html 文件必须存在，否则编译失败
+ * @note 编译时要求 web/ 目录及其子文件必须存在，否则编译失败
  */
-//go:embed web/usage.html
+//go:embed web
 var dashboardFS embed.FS
+
+/*
+ * @brief Dashboard 静态文件系统的子目录包装器
+ *
+ * 在 init 中通过 fs.Sub 剥离 "web" 前缀，使文件路径变为
+ * usage.html、css/style.css、js/app.js 的扁平形式。
+ */
+var webFS fs.FS
+
+func init() {
+	sub, err := fs.Sub(dashboardFS, "web")
+	if err != nil {
+		panic("failed to create web sub filesystem: " + err.Error())
+	}
+	webFS = sub
+}
 
 /*
  * @author  chensong
  * @date   2026-04-26
- * @brief   处理 Usage Dashboard 页面的 HTTP 请求
+ * @brief  处理 Usage Dashboard 页面的 HTTP 请求
  *
  * 处理流程:
- *   1. 从内嵌文件系统 dashboardFS 中读取 web/usage.html
- *   2. 如果读取失败（如编译时未嵌入），返回 500 Internal Server Error
- *   3. 设置 Content-Type 为 text/html; charset=utf-8
- *   4. 将 HTML 内容写入 HTTP 响应体
+ *  1. 从内嵌文件系统 webFS 中读取 usage.html
+ *  2. 如果读取失败（如编译时未嵌入），返回 500 Internal Server Error
+ *  3. 设置 Content-Type 为 text/html; charset=utf-8
+ *  4. 将 HTML 内容写入 HTTP 响应体
  *
  * @param   p *Proxy           代理实例（方法接收者）
  * @param   w http.ResponseWriter  HTTP 响应写入器
@@ -68,11 +87,29 @@ var dashboardFS embed.FS
  *         前端随后通过 /api/usage/stream 建立 SSE 连接获取实时数据
  */
 func (p *Proxy) handleUsageDashboard(w http.ResponseWriter, r *http.Request) {
-	data, err := dashboardFS.ReadFile("web/usage.html")
+	data, err := fs.ReadFile(webFS, "usage.html")
 	if err != nil {
 		http.Error(w, "dashboard not available", http.StatusInternalServerError)
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	_, _ = w.Write(data)
+}
+
+/*
+ * @author  chensong
+ * @date   2026-04-30
+ * @brief  处理静态文件请求（CSS、JS 等）
+ *
+ * 处理流程:
+ *  1. 使用 http.FileServer 从内嵌的 webFS 中提供静态文件
+ *  2. 自动设置正确的 Content-Type（text/css、application/javascript 等）
+ *
+ * @param   w http.ResponseWriter  HTTP 响应写入器
+ * @param   r *http.Request    客户端 HTTP 请求
+ *
+ * @note   该处理器注册在 /static/ 路径上，通过 StripPrefix 去除 /static/ 前缀
+ */
+func handleStatic(w http.ResponseWriter, r *http.Request) {
+	http.StripPrefix("/static/", http.FileServer(http.FS(webFS))).ServeHTTP(w, r)
 }

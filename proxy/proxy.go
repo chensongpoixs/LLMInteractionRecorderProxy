@@ -202,10 +202,13 @@ func New(cfg *config.Config, storageLogger *storage.Logger, metrics *Metrics, ap
 	mux.HandleFunc("/v1/models", proxy.handleModels)
 	// Usage dashboard endpoints
 	mux.HandleFunc("/usage", proxy.handleUsageDashboard)
+	mux.HandleFunc("/static/", handleStatic)
 	mux.HandleFunc("/api/usage/summary", proxy.handler.HandleUsageSummary)
 	mux.HandleFunc("/api/usage/stream", proxy.handler.HandleUsageStream)
 	mux.HandleFunc("/api/prompts/dates", proxy.handler.HandlePromptDates)
 	mux.HandleFunc("/api/prompts", proxy.handler.HandlePromptList)
+	mux.HandleFunc("/api/prompts/conversations", proxy.handler.HandleConversations)
+	mux.HandleFunc("/api/prompts/conversation", proxy.handler.HandleConversationDetail)
 
 	// Agent chat endpoint (ReAct)
 	mux.HandleFunc("/api/chat/agent", proxy.handleAgentChat)
@@ -1430,6 +1433,11 @@ func (p *Proxy) handleAnthropicPassthrough(w http.ResponseWriter, r *http.Reques
 	if sessionID == "" {
 		sessionID = "session_" + modelName
 	}
+	// Parse request body for logging
+	var reqBody map[string]interface{}
+	if len(rawBody) > 0 {
+		json.Unmarshal(rawBody, &reqBody)
+	}
 	// inject missing thinking blocks for DeepSeek thinking mode
 	fixedBody := p.fixAnthropicThinkingBlocksForPassthrough(rawBody, sessionID)
 	targetURL := anthropicBase + "/messages"
@@ -1468,7 +1476,7 @@ func (p *Proxy) handleAnthropicPassthrough(w http.ResponseWriter, r *http.Reques
 			"Upstream call failed (anthropic passthrough): call_id=%s elapsed=%v err=%v",
 			upstreamCallID, time.Since(upstreamStart), err,
 		)
-		p.logRequest(nil, modelName, "messages", start, 500, nil, false, err.Error(), nil, requestLogger)
+		p.logRequestFull(reqBody, nil, "", sessionID, "", 0, modelName, "messages", start, 500, nil, nil, false, err.Error(), nil, requestLogger)
 		http.Error(w, "Proxy error: "+err.Error(), http.StatusBadGateway)
 		return
 	}
@@ -1485,7 +1493,7 @@ func (p *Proxy) handleAnthropicPassthrough(w http.ResponseWriter, r *http.Reques
 			return
 		}
 		requestLogger.Error("Failed to read anthropic passthrough response: %v", err)
-		p.logRequest(nil, modelName, "messages", start, resp.StatusCode, nil, false, err.Error(), nil, requestLogger)
+		p.logRequestFull(reqBody, nil, "", sessionID, "", 0, modelName, "messages", start, resp.StatusCode, nil, nil, false, err.Error(), nil, requestLogger)
 		http.Error(w, "Failed to read response", http.StatusBadGateway)
 		return
 	}
@@ -1495,12 +1503,10 @@ func (p *Proxy) handleAnthropicPassthrough(w http.ResponseWriter, r *http.Reques
 
 	var respParsed map[string]interface{}
 	json.Unmarshal(respBody, &respParsed)
-	// record conversation for future thinking-block injection
-	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-		p.recordAnthropicPassthroughConversation(respParsed, sessionID)
-	}
+	// Extract conversation context and log with full context
+	conversationMessages, systemPrompt, turnIndex, conversationID := p.extractAndUpdateConversation(sessionID, reqBody, modelName)
 	tokensUsed := p.extractTokens(respParsed)
-	p.logRequest(nil, modelName, "messages", start, resp.StatusCode, respBody, false, "", tokensUsed, requestLogger)
+	p.logRequestFull(reqBody, conversationMessages, systemPrompt, sessionID, conversationID, turnIndex, modelName, "messages", start, resp.StatusCode, respBody, nil, false, "", tokensUsed, requestLogger)
 
 	w.Header().Set("Content-Type", resp.Header.Get("Content-Type"))
 	w.WriteHeader(resp.StatusCode)
@@ -1518,6 +1524,11 @@ func (p *Proxy) handleAnthropicPassthroughStream(w http.ResponseWriter, r *http.
 	sessionID := r.Header.Get("X-Session-ID")
 	if sessionID == "" {
 		sessionID = fmt.Sprintf("session_%s_stream", modelName)
+	}
+	// Parse request body for logging
+	var reqBody map[string]interface{}
+	if len(rawBody) > 0 {
+		json.Unmarshal(rawBody, &reqBody)
 	}
 	// inject missing thinking blocks for DeepSeek thinking mode
 	fixedBody := p.fixAnthropicThinkingBlocksForPassthrough(rawBody, sessionID)
@@ -1558,7 +1569,7 @@ func (p *Proxy) handleAnthropicPassthroughStream(w http.ResponseWriter, r *http.
 			"Upstream call failed (anthropic passthrough stream): call_id=%s elapsed=%v err=%v",
 			upstreamCallID, time.Since(upstreamStart), err,
 		)
-		p.logRequest(nil, modelName, "messages", start, 500, nil, true, err.Error(), nil, requestLogger)
+		p.logRequest(reqBody, modelName, "messages", start, 500, nil, true, err.Error(), nil, requestLogger)
 		http.Error(w, "Proxy error: "+err.Error(), http.StatusBadGateway)
 		return
 	}
@@ -1697,30 +1708,10 @@ func (p *Proxy) handleAnthropicPassthroughStream(w http.ResponseWriter, r *http.
 		}
 	}
 
-	// record conversation for future thinking-block injection
-	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-		assistantMsg := storage.MessageLog{
-			Role:      "assistant",
-			Content:   strings.TrimSpace(aggregatedContent),
-			Reasoning: strings.TrimSpace(aggregatedReasoning),
-		}
-		p.appendConversation(sessionID, nil, assistantMsg)
-	}
-	reqLog := &storage.RequestLog{
-		ID:                 "req_" + nextUniqueID(),
-		Timestamp:          time.Now(),
-		SessionID:          sessionID,
-		Endpoint:           "messages",
-		Method:             "POST",
-		Model:              modelName,
-		Provider:           modelName,
-		RequestBody:        anthropicReq,
-		StatusCode:         resp.StatusCode,
-		Stream:             true,
-		Duration:           time.Since(start).String(),
-		AggregatedResponse: aggregatedResponse,
-	}
-	p.logger.SaveRequest(reqLog)
+	// Extract conversation context for proper conversation grouping
+	conversationMessages, systemPrompt, turnIndex, conversationID := p.extractAndUpdateConversation(sessionID, anthropicReq, modelName)
+	// Log with full conversation context
+	p.logRequestFull(anthropicReq, conversationMessages, systemPrompt, sessionID, conversationID, turnIndex, modelName, "messages", start, resp.StatusCode, nil, aggregatedResponse, true, "", nil, requestLogger)
 }
 
 // handleStreaming manages streaming responses

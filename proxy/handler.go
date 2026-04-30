@@ -221,6 +221,85 @@ type promptDatesResponse struct {
 	Months []promptDateMonth `json:"months"` ///< 月份列表，按月降序排列
 }
 
+// =============================================================================
+// 对话浏览（DeepSeek 风格）相关结构体
+// =============================================================================
+
+// conversationListItem 代表对话列表中的单个对话项。
+//
+// 每个对话项对应一次或多次按 ConversationID / SessionID 分组的请求，
+// 其中 title 由首条用户消息自动生成（截断至 120 字符）。
+// 仅非流式请求参与对话分组；流式请求因缺少 ConversationID 上下文而被排除。
+//
+// @author chensong
+// @date   2026-04-30
+// @brief 对话列表项，用于侧栏展示
+type conversationListItem struct {
+	ID        string `json:"id"`         // ConversationID 或 SessionID
+	Title     string `json:"title"`      // 首条用户消息文本（截断 120 字符）
+	Timestamp string `json:"timestamp"`  // 对话首轮时间戳（RFC3339 格式）
+	Model     string `json:"model"`      // 首轮使用的模型名称
+	TurnCount int    `json:"turn_count"` // 对话轮数
+	Preview   string `json:"preview"`    // 首条用户消息的前 100 字符预览
+}
+
+// conversationListResponse 封装对话列表的 API 响应。
+//
+// @author chensong
+// @date   2026-04-30
+// @brief 对话列表查询响应
+type conversationListResponse struct {
+	Conversations []conversationListItem  `json:"conversations"` // 对话列表，按时间降序（指定 date 时）
+	Groups        []conversationDateGroup `json:"groups"`        // 按日期分组的对话列表（未指定 date 时）
+	Date          string                  `json:"date"`          // 查询日期（YYYYMMDD），指定 date 时返回
+}
+
+// conversationDateGroup 按日期标签分组的对话列表。
+//
+// 用于 DeepSeek 风格侧栏：今天 / 昨天 / 本周 / 更早。
+//
+// @author chensong
+// @date   2026-04-30
+// @brief 按日期标签分组的对话组
+type conversationDateGroup struct {
+	Label         string                 `json:"label"`         // 日期标签："今天" / "昨天" / "本周" / "本月" / "更早"
+	Date          string                 `json:"date"`          // 实际日期（YYYY-MM-DD 格式），"更早" 下可能为空
+	Conversations []conversationListItem `json:"conversations"` // 该日期下的对话列表
+}
+
+// conversationTurn 表示对话中的单轮交互。
+//
+// Thinking 与 Response 作为独立字段返回（不复用拼接格式），
+// 前端负责决定是否折叠 Thinking 以及样式化渲染。
+//
+// @author chensong
+// @date   2026-04-30
+// @brief 对话中的一论交互记录
+type conversationTurn struct {
+	TurnIndex    int    `json:"turn_index"`    // 轮次序号（从 1 开始）
+	UserMessage  string `json:"user_message"`  // 用户消息文本
+	Thinking     string `json:"thinking"`      // 思考过程（无推理时为空字符串）
+	Response     string `json:"response"`      // 模型最终回复
+	Model        string `json:"model"`         // 该轮使用的模型名
+	PromptTokens int    `json:"prompt_tokens"` // 输入 token 数
+	TotalTokens  int    `json:"total_tokens"`  // 总计 token 数
+	Timestamp    string `json:"timestamp"`     // 该轮时间戳（RFC3339 格式）
+}
+
+// conversationDetailResponse 封装单个对话的完整详情 API 响应。
+//
+// @author chensong
+// @date   2026-04-30
+// @brief 对话详情查询响应
+type conversationDetailResponse struct {
+	ID        string             `json:"id"`         // 对话 ID
+	Title     string             `json:"title"`      // 对话标题（首条用户消息）
+	Timestamp string             `json:"timestamp"`  // 首轮时间戳
+	Model     string             `json:"model"`      // 首轮模型
+	TurnCount int                `json:"turn_count"` // 总轮数
+	Turns     []conversationTurn `json:"turns"`      // 各轮交互详情，按 TurnIndex 升序
+}
+
 // NewHandler 创建并初始化一个新的 Handler 实例。
 //
 // 处理流程：
@@ -1330,6 +1409,29 @@ func extractLastUserMessage(req map[string]interface{}) string {
 	return ""
 }
 
+// getLastUserMessageFromLog 从 RequestLog 中提取最后一条有效用户消息。
+// 优先从 RequestBody 提取，若 RequestBody 为空则回退到 Messages 字段。
+func getLastUserMessageFromLog(rec storage.RequestLog) string {
+	if rec.RequestBody != nil {
+		if msg := extractLastUserMessage(rec.RequestBody); msg != "" {
+			return msg
+		}
+	}
+	// Fallback: extract from parsed Messages field
+	for i := len(rec.Messages) - 1; i >= 0; i-- {
+		m := rec.Messages[i]
+		if m.Role != "user" {
+			continue
+		}
+		s := strings.TrimSpace(m.Content)
+		if s == "" || isSystemMessage(s) {
+			continue
+		}
+		return s
+	}
+	return ""
+}
+
 // isSystemMessage 判断文本是否看起来像系统生成的指令消息（而非真实的用户输入）。
 //
 // 处理流程：
@@ -1507,6 +1609,558 @@ func round2(v float64) float64 {
 // @note 用于成功率等精度要求较高的指标展示格式化
 func round4(v float64) float64 {
 	return math.Round(v*10000) / 10000
+}
+
+// =============================================================================
+// 对话浏览（DeepSeek 风格）处理器
+// =============================================================================
+
+// HandleConversations 处理对话列表查询请求（GET /api/prompts/conversations）。
+//
+// 支持两种模式：
+//  - 指定 ?date=YYYYMMDD：返回该日期的平铺对话列表（旧模式）
+//  - 不指定 date：返回全部对话，按日期标签分组（DeepSeek 风格侧栏）
+//
+// @author chensong
+// @date   2026-04-30
+// @brief 对话列表查询端点
+// @param w http.ResponseWriter HTTP 响应写入器
+// @param r *http.Request HTTP 请求对象
+func (h *Handler) HandleConversations(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+		return
+	}
+
+	dateFilter := r.URL.Query().Get("date")
+	w.Header().Set("Content-Type", "application/json")
+
+	if dateFilter != "" {
+		// Specific date mode
+		resp, err := h.buildConversationList(dateFilter)
+		if err != nil {
+			h.appLogger.Error("buildConversationList failed: %v", err)
+			http.Error(w, `{"error":"failed to build conversation list"}`, http.StatusInternalServerError)
+			return
+		}
+		json.NewEncoder(w).Encode(resp)
+	} else {
+		// All conversations mode — grouped by date labels
+		resp, err := h.buildAllConversations()
+		if err != nil {
+			h.appLogger.Error("buildAllConversations failed: %v", err)
+			http.Error(w, `{"error":"failed to build conversation list"}`, http.StatusInternalServerError)
+			return
+		}
+		json.NewEncoder(w).Encode(resp)
+	}
+}
+
+// buildConversationList 扫描指定日期的日志文件，按 ConversationID / SessionID 分组构建对话列表。
+//
+// 处理流程：
+//  1. 调用 storageLogger.ListLogs 获取匹配日期的日志文件
+//  2. 遍历文件，逐行解析 RequestLog
+//  3. 排除 streams/ 子目录文件、流式请求（ConversationID 为空）、无用户消息的条目
+//  4. 按 ConversationID（优先）→ SessionID（回退）分组
+//  5. 为每组生成标题（首条用户消息，截断 120 字符）
+//  6. 按首条时间戳降序排列
+//
+// @author chensong
+// @date   2026-04-30
+// @brief 按日期构建对话分组列表
+// @param dateFilter string 日期过滤字符串（YYYYMMDD）
+// @return conversationListResponse 对话列表响应
+// @return error 处理过程中的错误
+func (h *Handler) buildConversationList(dateFilter string) (conversationListResponse, error) {
+	files, err := h.storageLogger.ListLogs("", dateFilter)
+	if err != nil {
+		return conversationListResponse{}, err
+	}
+
+	// convGroup holds the aggregated state for a single conversation.
+	type convGroup struct {
+		id           string
+		title        string
+		firstTS      time.Time
+		model        string
+		turnCount    int
+		preview      string
+		hasFirstUser bool
+	}
+
+	groups := make(map[string]*convGroup)
+	groupOrder := make([]string, 0) // preserve insertion order by first-seen timestamp
+
+	for _, filePath := range files {
+		// Skip streams subdirectory
+		if strings.Contains(filePath, "/streams/") || strings.Contains(filePath, "\\streams\\") {
+			continue
+		}
+
+		records, err := h.storageLogger.ReadLog(filePath)
+		if err != nil {
+			continue // skip unreadable files
+		}
+
+		for _, raw := range records {
+			var rec storage.RequestLog
+			if err := json.Unmarshal(raw, &rec); err != nil {
+				continue
+			}
+
+
+			// Determine group key
+			groupKey := rec.ConversationID
+			if groupKey == "" {
+				groupKey = rec.SessionID
+			}
+			if groupKey == "" {
+				continue
+			}
+
+			// Extract user message
+			userMsg := getLastUserMessageFromLog(rec)
+			if userMsg != "" && isSystemMessage(userMsg) {
+				continue
+			}
+			// Strip system-reminder tags
+			if userMsg != "" {
+				userMsg = exporter.SystemReminderRE.ReplaceAllString(strings.TrimSpace(userMsg), "")
+			}
+
+			group, exists := groups[groupKey]
+			if !exists {
+				title := userMsg
+				if title == "" {
+					title = "对话 - " + rec.Model
+				}
+				if len([]rune(title)) > 120 {
+					title = string([]rune(title)[:120]) + "..."
+				}
+				preview := userMsg
+				if len([]rune(preview)) > 100 {
+					preview = string([]rune(preview)[:100]) + "..."
+				}
+				group = &convGroup{
+					id:           groupKey,
+					title:        title,
+					firstTS:      rec.Timestamp,
+					model:        rec.Model,
+					turnCount:    1,
+					preview:      preview,
+					hasFirstUser: true,
+				}
+				groups[groupKey] = group
+				groupOrder = append(groupOrder, groupKey)
+			} else {
+				group.turnCount++
+				// Keep the earliest timestamp as firstTS
+				if rec.Timestamp.Before(group.firstTS) {
+					group.firstTS = rec.Timestamp
+					// Update title to the earliest user message
+					title := userMsg
+					if len([]rune(title)) > 120 {
+						title = string([]rune(title)[:120]) + "..."
+					}
+					group.title = title
+					group.preview = userMsg
+					if len([]rune(group.preview)) > 100 {
+						group.preview = string([]rune(group.preview)[:100]) + "..."
+					}
+				}
+			}
+		}
+	}
+
+	// Build result list
+	items := make([]conversationListItem, 0, len(groups))
+	for _, key := range groupOrder {
+		g := groups[key]
+		items = append(items, conversationListItem{
+			ID:        g.id,
+			Title:     g.title,
+			Timestamp: g.firstTS.Format(time.RFC3339),
+			Model:     g.model,
+			TurnCount: g.turnCount,
+			Preview:   g.preview,
+		})
+	}
+
+	// Sort by timestamp descending
+	sort.Slice(items, func(i, j int) bool {
+		return items[i].Timestamp > items[j].Timestamp
+	})
+
+	return conversationListResponse{
+		Conversations: items,
+		Date:          dateFilter,
+	}, nil
+}
+
+// buildAllConversations 扫描全部日志文件，按日期标签分组构建对话列表。
+//
+// 分组策略（模仿 DeepSeek 侧栏）：
+//  - 今天 / 昨天 / 本周 / 本月 / YYYY年MM月 / 更早
+//  每个 date 下的对话按时间降序排列，group 整体也按时间降序排列。
+//
+// @author chensong
+// @date   2026-04-30
+// @brief 扫描全部日志构建按日期标签分组的对话列表
+// @return conversationListResponse 分组后的对话列表
+// @return error 处理错误
+func (h *Handler) buildAllConversations() (conversationListResponse, error) {
+	files, err := h.storageLogger.ListLogs("", "")
+	if err != nil {
+		return conversationListResponse{}, err
+	}
+
+	// conversationData holds per-date conversation items.
+	type conversationData struct {
+		date string // YYYY-MM-DD
+		item conversationListItem
+	}
+
+	// Map: date (YYYY-MM-DD) → convID → conversationListItem
+	dateGroups := make(map[string]map[string]conversationListItem)
+
+	for _, filePath := range files {
+		if strings.Contains(filePath, "/streams/") || strings.Contains(filePath, "\\streams\\") {
+			continue
+		}
+
+		records, err := h.storageLogger.ReadLog(filePath)
+		if err != nil {
+			continue
+		}
+
+		for _, raw := range records {
+			var rec storage.RequestLog
+			if err := json.Unmarshal(raw, &rec); err != nil {
+				continue
+			}
+
+
+			groupKey := rec.ConversationID
+			if groupKey == "" {
+				groupKey = rec.SessionID
+			}
+			if groupKey == "" {
+				continue
+			}
+
+			userMsg := getLastUserMessageFromLog(rec)
+			// Only skip records where the message looks like a system-generated notification.
+			// Empty messages get a placeholder title and are still included.
+			if userMsg != "" && isSystemMessage(userMsg) {
+				continue
+			}
+			if userMsg != "" {
+				userMsg = exporter.SystemReminderRE.ReplaceAllString(strings.TrimSpace(userMsg), "")
+			}
+
+			dateStr := rec.Timestamp.Format("2006-01-02")
+
+			if dateGroups[dateStr] == nil {
+				dateGroups[dateStr] = make(map[string]conversationListItem)
+			}
+
+			existing, exists := dateGroups[dateStr][groupKey]
+			if !exists {
+				title := userMsg
+				if title == "" {
+					title = "对话 - " + rec.Model
+				}
+				if len([]rune(title)) > 120 {
+					title = string([]rune(title)[:120]) + "..."
+				}
+				dateGroups[dateStr][groupKey] = conversationListItem{
+					ID:        groupKey,
+					Title:     title,
+					Timestamp: rec.Timestamp.Format(time.RFC3339),
+					Model:     rec.Model,
+					TurnCount: 1,
+				}
+			} else {
+				existing.TurnCount++
+				if rec.Timestamp.Format(time.RFC3339) < existing.Timestamp {
+					title := userMsg
+					if len([]rune(title)) > 120 {
+						title = string([]rune(title)[:120]) + "..."
+					}
+					existing.Title = title
+					existing.Timestamp = rec.Timestamp.Format(time.RFC3339)
+				}
+				dateGroups[dateStr][groupKey] = existing
+			}
+		}
+	}
+
+	// Compute date labels and build groups
+	now := time.Now()
+	today := now.Format("2006-01-02")
+	yesterday := now.AddDate(0, 0, -1).Format("2006-01-02")
+
+	// Monday of current week
+	weekday := now.Weekday()
+	if weekday == 0 {
+		weekday = 7
+	}
+	thisMonday := now.AddDate(0, 0, -int(weekday)+1).Format("2006-01-02")
+
+	thisMonth := now.Format("2006-01")
+
+	// dateLabel returns the DeepSeek-style label for a date.
+	dateLabel := func(dateStr string) string {
+		switch {
+		case dateStr == today:
+			return "今天"
+		case dateStr == yesterday:
+			return "昨天"
+		case dateStr >= thisMonday:
+			return "本周"
+		case strings.HasPrefix(dateStr, thisMonth):
+			return "本月"
+		default:
+			// Format as "2026年04月"
+			if len(dateStr) >= 7 {
+				y := dateStr[:4]
+				m := dateStr[5:7]
+				return y + "年" + m + "月"
+			}
+			return "更早"
+		}
+	}
+
+	// Aggregate into label groups
+	labelOrder := []string{"今天", "昨天", "本周", "本月"}
+	labelGroups := make(map[string][]conversationListItem)
+	monthlyLabels := make(map[string]string) // label → dateStr for ordering
+	var monthlyKeys []string
+
+	for dateStr, convMap := range dateGroups {
+		label := dateLabel(dateStr)
+
+		items := make([]conversationListItem, 0, len(convMap))
+		for _, item := range convMap {
+			items = append(items, item)
+		}
+		sort.Slice(items, func(i, j int) bool { return items[i].Timestamp > items[j].Timestamp })
+
+		if label == "今天" || label == "昨天" || label == "本周" || label == "本月" {
+			labelGroups[label] = append(labelGroups[label], items...)
+		} else {
+			// Monthly or older groups
+			if _, exists := labelGroups[label]; !exists {
+				monthlyKeys = append(monthlyKeys, label)
+				monthlyLabels[label] = dateStr
+			}
+			labelGroups[label] = append(labelGroups[label], items...)
+		}
+	}
+
+	// Build ordered result
+	var groups []conversationDateGroup
+
+	for _, label := range labelOrder {
+		if items, ok := labelGroups[label]; ok {
+			sort.Slice(items, func(i, j int) bool { return items[i].Timestamp > items[j].Timestamp })
+			groups = append(groups, conversationDateGroup{
+				Label:         label,
+				Date:          "",
+				Conversations: items,
+			})
+		}
+	}
+
+	// Sort monthly labels by date descending
+	sort.Slice(monthlyKeys, func(i, j int) bool {
+		return monthlyLabels[monthlyKeys[i]] > monthlyLabels[monthlyKeys[j]]
+	})
+
+	for _, label := range monthlyKeys {
+		items := labelGroups[label]
+		sort.Slice(items, func(i, j int) bool { return items[i].Timestamp > items[j].Timestamp })
+		groups = append(groups, conversationDateGroup{
+			Label:         label,
+			Date:          monthlyLabels[label],
+			Conversations: items,
+		})
+	}
+
+	return conversationListResponse{
+		Groups: groups,
+	}, nil
+}
+
+// HandleConversationDetail 处理单个对话详情查询请求（GET /api/prompts/conversation）。
+//
+// 处理流程：
+//  1. 校验请求方法为 GET
+//  2. 从查询参数中提取 id（必填）
+//  3. 调用 buildConversationDetail 获取完整对话内容
+//  4. 序列化为 JSON 并返回
+//
+// @author chensong
+// @date   2026-04-30
+// @brief 对话详情查询端点
+// @param w http.ResponseWriter HTTP 响应写入器
+// @param r *http.Request HTTP 请求对象
+func (h *Handler) HandleConversationDetail(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+		return
+	}
+
+	convID := r.URL.Query().Get("id")
+	if convID == "" {
+		http.Error(w, `{"error":"missing required parameter: id"}`, http.StatusBadRequest)
+		return
+	}
+
+	resp, err := h.buildConversationDetail(convID)
+	if err != nil {
+		h.appLogger.Error("buildConversationDetail failed: %v", err)
+		http.Error(w, `{"error":"failed to build conversation detail"}`, http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
+}
+
+// buildConversationDetail 扫描全部日志文件，查找匹配指定 ID 的完整对话记录。
+//
+// 处理流程：
+//  1. 调用 storageLogger.ListLogs 获取全部日志文件
+//  2. 排除 streams/ 子目录
+//  3. 筛选 ConversationID 或 SessionID 匹配 id 的条目
+//  4. 按 TurnIndex 升序排列（回退到 Timestamp）
+//  5. 每轮提取 user_message（extractLastUserMessage）、thinking（extractResponse）、response（extractResponse）
+//  6. 标题 = 首条用户消息文本
+//
+// @author chensong
+// @date   2026-04-30
+// @brief 按对话 ID 构建完整对话详情
+// @param convID string 对话 ID（ConversationID 或 SessionID）
+// @return conversationDetailResponse 对话详情响应
+// @return error 处理过程中的错误
+func (h *Handler) buildConversationDetail(convID string) (conversationDetailResponse, error) {
+	files, err := h.storageLogger.ListLogs("", "")
+	if err != nil {
+		return conversationDetailResponse{}, err
+	}
+
+	type turnRec struct {
+		rec  storage.RequestLog
+		turn int
+	}
+
+	var matches []turnRec
+
+	for _, filePath := range files {
+		if strings.Contains(filePath, "/streams/") || strings.Contains(filePath, "\\streams\\") {
+			continue
+		}
+
+		records, err := h.storageLogger.ReadLog(filePath)
+		if err != nil {
+			continue
+		}
+
+		for _, raw := range records {
+			var rec storage.RequestLog
+			if err := json.Unmarshal(raw, &rec); err != nil {
+				continue
+			}
+
+			// Match by ConversationID or SessionID
+			if rec.ConversationID != convID && rec.SessionID != convID {
+				continue
+			}
+
+			matches = append(matches, turnRec{
+				rec:  rec,
+				turn: rec.TurnIndex,
+			})
+		}
+	}
+
+	// Sort by TurnIndex ascending, fallback to Timestamp
+	sort.Slice(matches, func(i, j int) bool {
+		if matches[i].turn != matches[j].turn {
+			return matches[i].turn < matches[j].turn
+		}
+		return matches[i].rec.Timestamp.Before(matches[j].rec.Timestamp)
+	})
+
+	// Build turns
+	turns := make([]conversationTurn, 0, len(matches))
+	var title string
+	var firstTS time.Time
+	var model string
+
+	for _, m := range matches {
+		rec := m.rec
+
+		userMsg := getLastUserMessageFromLog(rec)
+		if userMsg == "" || isSystemMessage(userMsg) {
+			userMsg = ""
+		} else {
+			userMsg = exporter.SystemReminderRE.ReplaceAllString(strings.TrimSpace(userMsg), "")
+		}
+
+		thinking, solution := extractResponse(&rec)
+
+		pTokens, _, totalTokens := tokensFromRecord(rec)
+
+		turns = append(turns, conversationTurn{
+			TurnIndex:    rec.TurnIndex,
+			UserMessage:  userMsg,
+			Thinking:     thinking,
+			Response:     solution,
+			Model:        rec.Model,
+			PromptTokens: int(pTokens),
+			TotalTokens:  int(totalTokens),
+			Timestamp:    rec.Timestamp.Format(time.RFC3339),
+		})
+
+		// Capture first turn info for header
+		if title == "" && userMsg != "" {
+			title = userMsg
+			if len([]rune(title)) > 120 {
+				title = string([]rune(title)[:120]) + "..."
+			}
+			firstTS = rec.Timestamp
+			model = rec.Model
+		}
+		if title == "" && solution != "" {
+			title = solution
+			if len([]rune(title)) > 120 {
+				title = string([]rune(title)[:120]) + "..."
+			}
+		}
+		if firstTS.IsZero() {
+			firstTS = rec.Timestamp
+		}
+		if model == "" {
+			model = rec.Model
+		}
+	}
+
+	tsStr := ""
+	if !firstTS.IsZero() {
+		tsStr = firstTS.Format(time.RFC3339)
+	}
+
+	return conversationDetailResponse{
+		ID:        convID,
+		Title:     title,
+		Timestamp: tsStr,
+		Model:     model,
+		TurnCount: len(turns),
+		Turns:     turns,
+	}, nil
 }
 
 // responseWriter 是对 http.ResponseWriter 的装饰器包装。
