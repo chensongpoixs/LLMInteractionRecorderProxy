@@ -1961,26 +1961,16 @@ func (p *Proxy) getModelByProxyName(modelName string) *config.ModelConfig {
 	return nil
 }
 
-// translateModelNameInBody updates the model name in request body from proxy name to target model name.
-// Returns false if the model field is missing or not a string.
-// translateModelNameInBody 将请求体中的 proxy 模型名翻译为上游实际模型名。
+// translateModelNameInBody validates the model field in the request body.
+// The client-requested model name is forwarded to upstream as-is — no translation.
+// Returns false so the caller keeps the original body unchanged.
+// translateModelNameInBody 校验请求体中的 model 字段。
+// 客户端请求的模型名直接透传给上游，不再通过配置表翻译。
 // @author chensong  @date 2026-04-26
 
 func (p *Proxy) translateModelNameInBody(reqBody map[string]interface{}) bool {
-	modelRaw, exists := reqBody["model"]
-	if !exists {
-		return false
-	}
-	modelName, ok := modelRaw.(string)
-	if !ok {
-		return false
-	}
-	modelConfig := p.getModelByProxyName(modelName)
-	if modelConfig == nil {
-		return false
-	}
-	reqBody["model"] = modelConfig.ModelName
-	return true
+	// Client-requested model name is forwarded as-is, no config translation needed.
+	return false
 }
 
 // logRequest logs a request/response pair
