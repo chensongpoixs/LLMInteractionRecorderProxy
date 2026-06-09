@@ -1063,14 +1063,210 @@ type OpusTrainRow struct {
  * @struct  OpusTrainMsg
  * @author  chensong
  * @date    2026-06-09
- * @brief   Opus 训练格式中的单条消息
+ * @brief   Opus 训练格式中的单条消息，兼容 OpenAI 微调标准格式
  *
- * @field role    消息角色：system / user / assistant
- * @field content 消息文本内容（assistant 角色可能包含 <think> 标签包裹的推理内容）
+ * @field role       消息角色：system / user / assistant / tool
+ * @field content    消息文本内容
+ * @field toolCalls  工具调用列表（仅 assistant 角色），OpenAI 标准格式
+ * @field toolCallID 工具调用 ID（仅 tool 角色），关联对应的 tool_use
  */
 type OpusTrainMsg struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role        string          `json:"role"`
+	Content     string          `json:"content"`
+	ToolCalls   []ToolCallEntry `json:"tool_calls,omitempty"`
+	ToolCallID  string          `json:"tool_call_id,omitempty"`
+}
+
+/*
+ * @struct  ToolCallEntry
+ * @author  chensong
+ * @date    2026-06-09
+ * @brief   OpenAI 标准工具调用格式
+ */
+type ToolCallEntry struct {
+	ID       string       `json:"id"`
+	Type     string       `json:"type"`
+	Function FunctionCall `json:"function"`
+}
+
+type FunctionCall struct {
+	Name      string `json:"name"`
+	Arguments string `json:"arguments"`
+}
+
+/*
+ * @func   extractOpusBlockMessages
+ * @author chensong
+ * @date   2026-06-09
+ * @brief  OpenAI 微调标准格式提取消息
+ *
+ * 将请求体 messages 转换为 OpenAI 标准格式：
+ *   - assistant 消息：content（thinking→<think>标签 + text）+ tool_calls（tool_use）
+ *   - user 消息：content（text）
+ *   - tool 消息：content（tool_result）+ tool_call_id
+ *
+ * 参考：https://platform.openai.com/docs/guides/fine-tuning
+ */
+func extractOpusBlockMessages(reqBody map[string]interface{}) []OpusTrainMsg {
+	msgsRaw, ok := reqBody["messages"].([]interface{})
+	if !ok || len(msgsRaw) == 0 {
+		return nil
+	}
+	var result []OpusTrainMsg
+	for _, mRaw := range msgsRaw {
+		msg, ok := mRaw.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		role, _ := msg["role"].(string)
+		content := msg["content"]
+
+		switch role {
+		case "system":
+			// system: content is a string
+			if c, ok := content.(string); ok && c != "" {
+				result = append(result, OpusTrainMsg{Role: "system", Content: c})
+			}
+		case "user":
+			switch c := content.(type) {
+			case string:
+				if c != "" {
+					result = append(result, OpusTrainMsg{Role: "user", Content: c})
+				}
+			case []interface{}:
+				hasToolResult := false
+				for _, blockRaw := range c {
+					block, ok := blockRaw.(map[string]interface{})
+					if !ok {
+						continue
+					}
+					blockType, _ := block["type"].(string)
+					if blockType == "tool_result" {
+						hasToolResult = true
+						// tool_result → role: "tool", tool_call_id from the block
+						toolUseID, _ := block["tool_use_id"].(string)
+						var contentStr string
+						if resContent, ok := block["content"]; ok {
+							switch rc := resContent.(type) {
+							case string:
+								contentStr = rc
+							case []interface{}:
+								var parts []string
+								for _, item := range rc {
+									if m, ok := item.(map[string]interface{}); ok {
+										if t, ok := m["text"].(string); ok {
+											parts = append(parts, t)
+										}
+									}
+								}
+								contentStr = strings.Join(parts, "\n")
+							}
+						}
+						result = append(result, OpusTrainMsg{
+							Role:       "tool",
+							Content:    contentStr,
+							ToolCallID: toolUseID,
+						})
+					} else if blockType == "text" || blockType == "" {
+						if text, ok := block["text"].(string); ok {
+							result = append(result, OpusTrainMsg{Role: "user", Content: text})
+						}
+					}
+				}
+				if !hasToolResult {
+					// No tool_result: collect text blocks as user message
+					textParts := collectTextBlocks(c)
+					if textParts != "" {
+						result = append(result, OpusTrainMsg{Role: "user", Content: textParts})
+					}
+				}
+			}
+		case "assistant":
+			switch c := content.(type) {
+			case string:
+				if c != "" {
+					result = append(result, OpusTrainMsg{Role: "assistant", Content: c})
+				}
+			case []interface{}:
+				var thinkingText string
+				var contentText string
+				var toolCalls []ToolCallEntry
+
+				for _, blockRaw := range c {
+					block, ok := blockRaw.(map[string]interface{})
+					if !ok {
+						continue
+					}
+					blockType, _ := block["type"].(string)
+
+					switch blockType {
+					case "thinking":
+						if t, ok := block["thinking"].(string); ok && t != "" {
+							thinkingText = t
+						} else if t, ok := block["text"].(string); ok && t != "" {
+							thinkingText = t
+						}
+					case "text", "":
+						if t, ok := block["text"].(string); ok {
+							contentText = t
+						}
+					case "tool_use":
+						id, _ := block["id"].(string)
+						name, _ := block["name"].(string)
+						argsStr := "{}"
+						if input, ok := block["input"]; ok && input != nil {
+							argsBytes, _ := json.Marshal(input)
+							argsStr = string(argsBytes)
+						}
+						toolCalls = append(toolCalls, ToolCallEntry{
+							ID:   id,
+							Type: "function",
+							Function: FunctionCall{
+								Name:      name,
+								Arguments: argsStr,
+							},
+						})
+					}
+				}
+
+				// Build assistant message content: <think> + text
+				var finalContent string
+				if thinkingText != "" {
+					finalContent = "<think>\n" + thinkingText + "\n</think>"
+					if contentText != "" {
+						finalContent += "\n\n" + contentText
+					}
+				} else {
+					finalContent = contentText
+				}
+
+				asstMsg := OpusTrainMsg{Role: "assistant", Content: finalContent}
+				if len(toolCalls) > 0 {
+					asstMsg.ToolCalls = toolCalls
+				}
+				result = append(result, asstMsg)
+			}
+		}
+	}
+	return result
+}
+
+// collectTextBlocks extracts text from content block arrays for user messages.
+func collectTextBlocks(blocks []interface{}) string {
+	var parts []string
+	for _, blockRaw := range blocks {
+		block, ok := blockRaw.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		blockType, _ := block["type"].(string)
+		if blockType == "text" || blockType == "" {
+			if text, ok := block["text"].(string); ok && text != "" {
+				parts = append(parts, text)
+			}
+		}
+	}
+	return strings.Join(parts, "\n")
 }
 
 /*
@@ -1123,13 +1319,20 @@ func buildOpusTrainRow(rec *storage.RequestLog, streamIndex map[string][]string)
 	}
 
 	// 2. Collect request-side conversation messages (multi-turn history).
-	//    These are all messages the client sent in the request body,
-	//    which for tracked conversations includes prior user/assistant turns.
-	var requestMsgs []storage.MessageLog
+	//    Each content block keeps its original type as role:
+	//    - text/string → user/assistant
+	//    - thinking → thinking
+	//    - tool_use → tool_use
+	//    - tool_result → tool_result
+	var requestMsgs []OpusTrainMsg
 	if len(rec.Messages) > 0 {
-		requestMsgs = rec.Messages
+		// Use pre-tracked conversation history (already flattened)
+		for _, msg := range rec.Messages {
+			requestMsgs = append(requestMsgs, OpusTrainMsg{Role: msg.Role, Content: msg.Content})
+		}
 	} else {
-		requestMsgs, _, _ = storage.ExtractMessagesFromRequest(rec.RequestBody)
+		// Process raw request body with block-level granularity
+		requestMsgs = extractOpusBlockMessages(rec.RequestBody)
 	}
 
 	// 3. Extract response thinking + solution from proxy response data only.
@@ -1151,17 +1354,13 @@ func buildOpusTrainRow(rec *storage.RequestLog, streamIndex map[string][]string)
 	}
 
 	// 4. Build full conversation messages from request history + current response.
-	//    This preserves the complete multi-turn dialog structure.
+	//    Each content block keeps its original type as role:
+	//    - user/assistant (text blocks)
+	//    - thinking
+	//    - tool_use
+	//    - tool_result
 	for _, msg := range requestMsgs {
-		if msg.Role == "assistant" && msg.Reasoning != "" {
-			// Embed previous-turn reasoning inside <think> tags
-			messages = append(messages, OpusTrainMsg{
-				Role:    "assistant",
-				Content: "<think>\n" + msg.Reasoning + "\n</think>\n\n" + msg.Content,
-			})
-		} else {
-			messages = append(messages, OpusTrainMsg{Role: msg.Role, Content: msg.Content})
-		}
+		messages = append(messages, msg)
 	}
 
 	// 5. Append current assistant response as the final message.

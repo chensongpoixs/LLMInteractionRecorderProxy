@@ -2326,6 +2326,10 @@ func (p *Proxy) handleExportDay(w http.ResponseWriter, r *http.Request) {
 		outPath = filepath.Join(outDir, prefix+dateStr+".jsonl")
 		p.appLogger.Info("Export triggered via API (messages format) for date: %s -> %s", dateStr, outPath)
 		n, exportErr = exporter.ExportMessagesDay(p.config.Storage.Directory, day, outPath)
+	case "opus":
+		outPath = filepath.Join(outDir, prefix+dateStr+".jsonl")
+		p.appLogger.Info("Export triggered via API (opus format) for date: %s -> %s", dateStr, outPath)
+		n, exportErr = exporter.ExportOpusTrainFormatDay(p.config.Storage.Directory, day, outPath)
 	default:
 		outPath = filepath.Join(outDir, prefix+dateStr+".jsonl")
 		p.appLogger.Info("Export triggered via API for date: %s -> %s", dateStr, outPath)

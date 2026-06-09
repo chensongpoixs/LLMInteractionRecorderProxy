@@ -27,7 +27,7 @@ Client ──► proxy-llm (Go HTTP 服务) ──► LLM 服务商 API
 | `proxy` | `proxy/upstream_httplog.go` | 上游 HTTP 日志（客户端→代理→LLM） |
 | `proxy` | `proxy/dashboard.go` | Usage Dashboard 前端页面（内嵌 Vue） |
 | `storage` | `storage/storage.go` | JSONL 文件日志，请求/响应对的持久化 |
-| `exporter` | `exporter/exporter.go` | 每日合并导出为训练数据集格式（reasoning / messages / opus / dataset 四种格式） |
+| `exporter` | `exporter/exporter.go` | 每日合并导出为训练数据集格式（reasoning / messages / opus / dataset 四种格式），opus 使用 OpenAI 微调标准格式（含 tool_calls + tool 角色） |
 | `logger` | `logger/logger.go` | 结构化日志系统，支持文件滚动、请求级日志 |
 
 ## 开发命令

@@ -480,13 +480,13 @@ func sandboxPath(workspace, userPath string) (string, error) {
 
 ## 7. 数据集导出系统
 
-### 7.1 四种导出格式
+### 7.1 五种导出格式
 
 | 格式 | 输出 | 过滤 | 去重 | 评分 | 适用场景 |
 |------|------|------|------|------|---------|
 | `reasoning` | 单个 `{prefix}YYYYMMDD.jsonl` | 无 | 无 | 无 | 推理链训练（Opus 4.6 风格） |
 | `messages` | 单个 `{prefix}YYYYMMDD.jsonl` | 无 | 无 | 无 | OpenAI 微调 API 直接使用 |
-| `opus` | 单个 `{prefix}YYYYMMDD.jsonl` | 基本 | SHA256 | 无 | 与 `code_train.jsonl` 参考格式对齐的训练集 |
+| `opus` | 单个 `{prefix}YYYYMMDD.jsonl` | 基本 | SHA256 | 无 | **OpenAI 微调标准格式**，含 `tool_calls` 和 `tool` 角色 |
 | `dataset` | 4 目录 + `metadata.csv` | 4 层质量控制 | SHA256 | 0-1 自动评分 | 全场景工业标准训练数据集 |
 
 ### 7.2 Dataset 格式（推荐）
@@ -504,51 +504,98 @@ exports/20260428/
 └── metadata.csv            # 聚合统计：total_records, filtered_out, by_language, by_model, avg_quality_score
 ```
 
-### 7.3 Opus 训练格式（完整多轮对话）
+### 7.3 Opus 训练格式（OpenAI 微调标准格式）
 
-与 `code_train.jsonl` 参考格式完全对齐，适用于 Claude Opus 训练数据集的导入。
+输出遵循 **OpenAI 微调标准格式**（兼容 GPT / Claude / DeepSeek 等所有主流模型训练平台），完整保留多轮对话、思考过程、工具调用和工具执行结果。
 
 ```
 exports/{prefix}YYYYMMDD.jsonl
 ```
 
-每行 JSON 结构（含多轮对话示例）：
+每行 JSON 结构示例：
 
 ```json
 {
   "category": "coding",
   "messages": [
-    {"role": "system", "content": "You are a computer science tutor..."},
-    {"role": "user", "content": "A triangle has sides of length 5, 12, and 13..."},
-    {"role": "assistant", "content": "<think>\n推理过程...\n</think>\n\n最终回答..."},
-    {"role": "user", "content": "What about a 3-4-5 triangle?"},
-    {"role": "assistant", "content": "<think>\n再次推理...\n</think>\n\n再次回答..."}
+    {"role": "system", "content": "You are a helpful assistant."},
+    {"role": "user", "content": "Read the file config.yaml"},
+    {
+      "role": "assistant",
+      "content": "<think>\n用户需要读取配置文件，我先查看文件内容\n</think>\n\n让我来读取这个文件。",
+      "tool_calls": [
+        {
+          "id": "call_abc123",
+          "type": "function",
+          "function": {
+            "name": "Read",
+            "arguments": "{\"file_path\": \"config.yaml\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "tool_call_id": "call_abc123",
+      "content": "# Configuration\nserver:\n  port: 8080\n..."
+    },
+    {"role": "assistant", "content": "配置文件内容如下：端口为 8080"}
   ],
-  "model": "claude-opus-4-6"
+  "model": "deepseek-v4-flash"
 }
 ```
 
-> messages 字段**完整保留**客户端发送的所有历史对话轮次，而非仅最后一条 user + assistant 对。
+#### 角色映射规则
 
-**字段说明**：
+| 原始 content block 类型 | 父消息角色 | 输出消息 | 说明 |
+|---|---|---|---|
+| `text` | user | `{"role": "user", "content": "..."}` | 用户文本输入 |
+| `text` | assistant | `{"role": "assistant", "content": "..."}` | 助手文本回复 |
+| `thinking` | assistant | 嵌入 content 的 `<think>` 标签 | 思考过程标记 |
+| `tool_use` | assistant | 附加到 assistant 的 `tool_calls[]` 数组 | OpenAI 标准工具调用格式 |
+| `tool_result` | user | `{"role": "tool", "tool_call_id": "...", "content": "..."}` | 工具执行结果 |
 
-| 字段 | 说明 |
-|------|------|
+#### 字段说明
+
+| 顶层字段 | 说明 |
+|----------|------|
 | `category` | 任务分类映射：code → `"coding"`, math → `"math"`, general → `"general"` |
-| `messages` | **完整多轮对话**消息数组（system/user/assistant），按对话顺序排列 |
+| `messages` | 完整多轮对话消息数组（system/user/assistant/tool），按对话顺序排列 |
 | `model` | 使用的模型名称 |
 
+**消息角色**：
+
+| 角色 | 适用场景 | 携带字段 |
+|------|---------|---------|
+| `system` | 系统提示词 | `content` |
+| `user` | 用户输入 | `content` |
+| `assistant` | 助手回复 | `content`（含 `<think>` 思考标签）+ `tool_calls[]`（工具调用） |
+| `tool` | 工具执行结果 | `tool_call_id`（关联对应的 tool_use）+ `content`（结果数据） |
+
 **Assistant content 格式**：
-- 若请求包含思考过程（reasoning/thinking），将其嵌入 `<think>...</think>` 标签内，后接最终回答
+- 若请求包含 `thinking` 类型 content block，将其嵌入 `<think>...</think>` 标签内，作为 content 的前缀
 - 若无思考过程，仅输出回答文本
-- 历史对话中的 assistant 如果有 reasoning，同样嵌入 `<think>` 标签
+- 若有工具调用，`tool_calls` 字段使用 OpenAI 标准格式：
+  ```json
+  {
+    "id": "call_xxx",
+    "type": "function",
+    "function": {
+      "name": "工具名",
+      "arguments": "{\"参数1\":\"值1\"}"
+    }
+  }
+  ```
 
 **数据流**：
-1. 优先使用预追踪的 `rec.Messages` 链（完整的请求端多轮对话历史）
-2. 回退到通过 `storage.ExtractMessagesFromRequest()` 从请求体解析消息链
-3. 从代理响应数据中提取 thinking + solution（优先级：AggregatedResponse → ResponseBody → stream chunks）
-4. 拼接：请求端所有消息（含历史 assistant 的 reasoning）+ 当前响应作为最后一条 assistant
-5. SHA256 去重：基于所有消息内容拼接后的哈希值
+1. 优先使用预追踪的 `rec.Messages` 链
+2. 回退到 `extractOpusBlockMessages()` — 按 content block 粒度遍历请求体 messages，按角色映射规则转换
+3. `thinking` 块合并到 assistant 的 `<think>` 标签
+4. `tool_use` 块合并到 assistant 的 `tool_calls[]` 数组
+5. `tool_result` 块转换为独立 `role: "tool"` 消息，通过 `tool_call_id` 关联原始调用
+6. 从代理响应数据中提取 thinking + solution（优先级：AggregatedResponse → ResponseBody → stream chunks）
+7. 当前响应作为最后一条 assistant 消息追加
+8. SHA256 去重：基于所有消息内容拼接后的哈希值
 
 ### 7.4 数据质量控制（dataset 格式）
 

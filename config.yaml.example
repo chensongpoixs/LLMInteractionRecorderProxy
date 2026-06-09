@@ -112,7 +112,7 @@ daily_export:
   enable: true
   output_dir: "./exports"
   file_prefix: "gpt-claude-gmini-"
-  export_format: "opus"    # "reasoning" / "messages" / "opus" (code_train.jsonl 格式, 保留多轮对话) / "dataset"
+  export_format: "opus"    # "reasoning" / "messages" / "opus" (OpenAI 微调标准格式, 含 tool_calls + tool 角色, 保留多轮对话) / "dataset"
   run_hour: 0
   run_minute: 5
   timezone: "Asia/Shanghai"

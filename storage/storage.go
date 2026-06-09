@@ -785,11 +785,40 @@ func extractTextContent(content interface{}) string {
 				continue
 			}
 			blockType, _ := block["type"].(string)
-			if blockType != "text" && blockType != "" {
-				continue
-			}
-			if text, ok := block["text"].(string); ok {
-				parts = append(parts, text)
+
+			switch blockType {
+			case "text", "":
+				// Plain text block
+				if text, ok := block["text"].(string); ok {
+					parts = append(parts, text)
+				}
+			case "thinking":
+				// Anthropic thinking block
+				if text, ok := block["thinking"].(string); ok && text != "" {
+					parts = append(parts, text)
+				} else if text, ok := block["text"].(string); ok && text != "" {
+					parts = append(parts, text)
+				}
+			case "tool_use":
+				// Tool call: format as "[工具调用: name] input"
+				name, _ := block["name"].(string)
+				if name == "" {
+					name = "unknown"
+				}
+				if input, ok := block["input"]; ok && input != nil {
+					inputBytes, _ := json.Marshal(input)
+					parts = append(parts, fmt.Sprintf("[工具调用: %s] 参数: %s", name, string(inputBytes)))
+				} else {
+					parts = append(parts, fmt.Sprintf("[工具调用: %s]", name))
+				}
+			case "tool_result":
+				// Tool result: recursively extract from content field
+				if resultContent, ok := block["content"]; ok {
+					extracted := extractTextContent(resultContent)
+					if extracted != "" {
+						parts = append(parts, extracted)
+					}
+				}
 			}
 		}
 		return strings.Join(parts, "\n")
@@ -841,11 +870,36 @@ func extractAnthropicTextContent(content interface{}) string {
 				continue
 			}
 			blockType, _ := block["type"].(string)
-			if blockType != "text" && blockType != "" {
-				continue
-			}
-			if text, ok := block["text"].(string); ok && strings.TrimSpace(text) != "" {
-				parts = append(parts, text)
+
+			switch blockType {
+			case "text", "":
+				if text, ok := block["text"].(string); ok && strings.TrimSpace(text) != "" {
+					parts = append(parts, text)
+				}
+			case "thinking":
+				if text, ok := block["thinking"].(string); ok && text != "" {
+					parts = append(parts, text)
+				} else if text, ok := block["text"].(string); ok && text != "" {
+					parts = append(parts, text)
+				}
+			case "tool_use":
+				name, _ := block["name"].(string)
+				if name == "" {
+					name = "unknown"
+				}
+				if input, ok := block["input"]; ok && input != nil {
+					inputBytes, _ := json.Marshal(input)
+					parts = append(parts, fmt.Sprintf("[工具调用: %s] 参数: %s", name, string(inputBytes)))
+				} else {
+					parts = append(parts, fmt.Sprintf("[工具调用: %s]", name))
+				}
+			case "tool_result":
+				if resultContent, ok := block["content"]; ok {
+					extracted := extractAnthropicTextContent(resultContent)
+					if extracted != "" {
+						parts = append(parts, extracted)
+					}
+				}
 			}
 		}
 		return strings.Join(parts, "\n")
