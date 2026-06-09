@@ -2269,7 +2269,7 @@ func (p *Proxy) handleExportDates(w http.ResponseWriter, r *http.Request) {
 
 // handleExportDay triggers export for a specific day.
 // handleExportDay 触发指定日期的数据导出。
-// 根据 export_format 参数调用 exporter.ExportDay/ExportMessagesDay/ExportDatasetDay。
+// 根据 export_format 参数调用 exporter.ExportDay/ExportMessagesDay/ExportOpusTrainFormatDay/ExportDatasetDay。
 // @author chensong  @date 2026-04-26
 
 func (p *Proxy) handleExportDay(w http.ResponseWriter, r *http.Request) {

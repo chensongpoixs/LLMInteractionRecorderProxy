@@ -197,7 +197,7 @@ type DailyExportConfig struct {
 	Enable       bool   `yaml:"enable"`        // 是否启用每日导出
 	OutputDir    string `yaml:"output_dir"`    // 导出文件输出目录
 	FilePrefix   string `yaml:"file_prefix"`   // 导出文件名前缀
-	ExportFormat string `yaml:"export_format"` // 导出格式："reasoning"、"messages"、"dataset"
+	ExportFormat string `yaml:"export_format"` // 导出格式："reasoning"、"messages"、"opus"、"dataset"
 	RunHour      int    `yaml:"run_hour"`      // 每日执行小时（0-23）
 	RunMinute    int    `yaml:"run_minute"`    // 每日执行分钟（0-59）
 	Timezone     string `yaml:"timezone"`      // 时区（例如 "Local"、"Asia/Shanghai"）

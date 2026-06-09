@@ -1022,7 +1022,301 @@ func recordHash(problem, thinking, solution string) string {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// 3. 行业标准四目录数据集导出 (ExportDatasetDay)
+// 3. Opus 训练格式导出 (ExportOpusTrainFormatDay)
+// ──────────────────────────────────────────────────────────────────────────────
+
+/*
+ * @struct  OpusTrainRow
+ * @author  chensong
+ * @date    2026-06-09
+ * @brief   Opus 训练数据集格式记录，与 code_train.jsonl 参考格式完全对齐
+ *
+ * 此格式直接匹配 Claude Opus 训练数据集的 JSONL 格式，每行包含：
+ * - category: 分类标签（"coding"/"math"/"general"）
+ * - messages: 完整多轮对话消息数组（system/user/assistant），
+ *             保留客户端发送的所有历史对话轮次，
+ *             assistant 的 content 内嵌 <think> 标签包裹推理内容
+ * - model: 使用的模型名称
+ *
+ * 参考格式示例（code_train.jsonl）：
+ * @code
+ * {"category": "coding", "messages": [
+ *   {"role": "system", "content": "You are a computer science tutor..."},
+ *   {"role": "user", "content": "A triangle has sides of length 5, 12, and 13..."},
+ *   {"role": "assistant", "content": "<think>\n推理过程...\n</think>\n\n最终回答..."},
+ *   {"role": "user", "content": "What about a 3-4-5 triangle?"},
+ *   {"role": "assistant", "content": "<think>\n再次推理...\n</think>\n\n再次回答..."}
+ * ], "model": "claude-opus-4-6"}
+ * @endcode
+ *
+ * @field category  任务分类：coding / math / general
+ * @field messages  完整多轮对话消息数组，按对话顺序排列
+ * @field model     模型名称
+ */
+type OpusTrainRow struct {
+	Category string            `json:"category"`
+	Messages []OpusTrainMsg    `json:"messages"`
+	Model    string            `json:"model,omitempty"`
+}
+
+/*
+ * @struct  OpusTrainMsg
+ * @author  chensong
+ * @date    2026-06-09
+ * @brief   Opus 训练格式中的单条消息
+ *
+ * @field role    消息角色：system / user / assistant
+ * @field content 消息文本内容（assistant 角色可能包含 <think> 标签包裹的推理内容）
+ */
+type OpusTrainMsg struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
+/*
+ * @func   buildOpusTrainRow
+ * @author chensong
+ * @date   2026-06-09
+ * @brief  从单条 RequestLog 构建 Opus 训练格式记录，保留完整多轮对话
+ *
+ * 处理流程：
+ *   1. 检查 RequestBody 是否为 nil
+ *   2. 添加 system 消息（如有）
+ *   3. 收集请求端多轮对话消息链（优先使用 rec.Messages，回退解析 RequestBody）
+ *   4. 从代理响应数据中提取 thinking + solution
+ *      （优先级：AggregatedResponse → ResponseBody → stream chunks）
+ *   5. 构建完整 messages 数组：
+ *      - 请求端所有消息按顺序加入（assistant 消息如有 reasoning 则嵌入 <think> 标签）
+ *      - 当前响应作为最后一条 assistant 消息追加（含 <think> 标签包裹推理内容）
+ *   6. 推断 category 映射：code → coding, math → math, general → general
+ *   7. 记录 model 名称
+ *
+ * 多轮对话示例（第 2 轮）：
+ *   请求端 messages: [{user, "Q1"}, {assistant, "A1"}, {user, "Q2"}]
+ *   当前响应: thinking="推理2", solution="回答2"
+ *   输出 messages: [
+ *     {system, "..."},
+ *     {user, "Q1"},
+ *     {assistant, "A1"},
+ *     {user, "Q2"},
+ *     {assistant, "<think>\n推理2\n</think>\n\n回答2"}
+ *   ]
+ *
+ * @param  rec          *storage.RequestLog  原始请求日志记录
+ * @param  streamIndex  map[string][]string  流式 chunk 索引
+ * @return OpusTrainRow 构建完成的训练格式记录（完整多轮对话）
+ * @return bool         是否成功构建
+ */
+func buildOpusTrainRow(rec *storage.RequestLog, streamIndex map[string][]string) (OpusTrainRow, bool) {
+	if rec.RequestBody == nil {
+		return OpusTrainRow{}, false
+	}
+
+	messages := make([]OpusTrainMsg, 0, 8)
+
+	// 1. System message
+	if rec.SystemPrompt != "" {
+		messages = append(messages, OpusTrainMsg{
+			Role:    "system",
+			Content: strings.TrimSpace(rec.SystemPrompt),
+		})
+	}
+
+	// 2. Collect request-side conversation messages (multi-turn history).
+	//    These are all messages the client sent in the request body,
+	//    which for tracked conversations includes prior user/assistant turns.
+	var requestMsgs []storage.MessageLog
+	if len(rec.Messages) > 0 {
+		requestMsgs = rec.Messages
+	} else {
+		requestMsgs, _, _ = storage.ExtractMessagesFromRequest(rec.RequestBody)
+	}
+
+	// 3. Extract response thinking + solution from proxy response data only.
+	//    Do NOT fall back to rec.Messages (which is request-side only),
+	//    to avoid picking up a re-sent assistant context as the "response".
+	thinking, solution := "", ""
+	if rec.AggregatedResponse != nil {
+		thinking, solution = fromAggregatedResponse(rec.AggregatedResponse)
+	}
+	if thinking == "" && solution == "" && rec.ResponseBody != nil {
+		thinking, solution = fromOpenAIStyleResponse(rec.ResponseBody)
+	}
+	if thinking == "" && solution == "" && rec.ResponseBody != nil {
+		thinking, solution = fromAnthropicStyleResponse(rec.ResponseBody)
+	}
+	if thinking == "" && solution == "" && rec.Stream {
+		agg := aggregateFromStreamChunks(streamIndex[rec.ID])
+		thinking, solution = parseOpenAIStreamAggregate(agg)
+	}
+
+	// 4. Build full conversation messages from request history + current response.
+	//    This preserves the complete multi-turn dialog structure.
+	for _, msg := range requestMsgs {
+		if msg.Role == "assistant" && msg.Reasoning != "" {
+			// Embed previous-turn reasoning inside <think> tags
+			messages = append(messages, OpusTrainMsg{
+				Role:    "assistant",
+				Content: "<think>\n" + msg.Reasoning + "\n</think>\n\n" + msg.Content,
+			})
+		} else {
+			messages = append(messages, OpusTrainMsg{Role: msg.Role, Content: msg.Content})
+		}
+	}
+
+	// 5. Append current assistant response as the final message.
+	if solution != "" || thinking != "" {
+		content := ""
+		if thinking != "" {
+			content = "<think>\n" + thinking + "\n</think>"
+			if solution != "" {
+				content += "\n\n" + solution
+			}
+		} else {
+			content = solution
+		}
+		messages = append(messages, OpusTrainMsg{Role: "assistant", Content: content})
+	}
+
+	// 6. Validate: need at least user + assistant pair.
+	if len(messages) < 2 {
+		return OpusTrainRow{}, false
+	}
+
+	// 7. Infer category from last user message + response.
+	lastUserContent := ""
+	for i := len(requestMsgs) - 1; i >= 0; i-- {
+		if requestMsgs[i].Role == "user" {
+			lastUserContent = requestMsgs[i].Content
+			break
+		}
+	}
+	internalCat := inferCategory(lastUserContent, solution, thinking)
+	category := "coding" // default matches reference file
+	switch internalCat {
+	case "math":
+		category = "math"
+	case "general":
+		category = "general"
+	}
+	// "code" → "coding" (already the default)
+
+	return OpusTrainRow{
+		Category: category,
+		Messages: messages,
+		Model:    rec.Model,
+	}, true
+}
+
+/*
+ * @func   ExportOpusTrainFormatDay
+ * @author chensong
+ * @date   2026-06-09
+ * @brief  将指定日期的所有请求日志导出为 Opus 训练格式 JSONL（保留完整多轮对话）
+ *
+ * 此格式与 code_train.jsonl 参考格式完全对齐，每行包含：
+ * {"category": "...", "messages": [...], "model": "..."}
+ *
+ * messages 字段保留请求端完整多轮对话历史 + 当前响应，格式为：
+ * - system: 系统提示词
+ * - user: 用户消息（含历史对话中的用户消息）
+ * - assistant: 助手回复（含 <think> 标签包裹的推理内容）
+ *
+ * 处理流程：
+ *   1. 扫描日目录下的所有 .jsonl 日志文件
+ *   2. 对流式请求构建 chunk 索引
+ *   3. 逐行解析 RequestLog，调用 buildOpusTrainRow 构建训练记录
+ *   4. SHA256 去重（基于所有消息内容拼接后的哈希值）
+ *   5. 写入输出 JSONL 文件
+ *
+ * @param  storageDir  原始 JSONL 日志的根目录 (如 ./data)
+ * @param  day         要导出的日期
+ * @param  outputPath  输出 JSONL 文件的完整路径
+ * @return n           成功导出的记录数
+ * @return err         错误信息
+ */
+func ExportOpusTrainFormatDay(storageDir string, day time.Time, outputPath string) (n int, err error) {
+	dateStr := day.Format("20060102")
+	dayDir := filepath.Join(storageDir, dateStr)
+	if st, e := os.Stat(dayDir); e != nil || !st.IsDir() {
+		return 0, fmt.Errorf("day directory not found: %s", dayDir)
+	}
+
+	logFiles := collectLogFiles(dayDir)
+	streamIndex, _ := buildStreamIndex(filepath.Join(dayDir, "streams"))
+
+	if err := os.MkdirAll(filepath.Dir(outputPath), 0755); err != nil {
+		return 0, err
+	}
+	out, err := os.Create(outputPath)
+	if err != nil {
+		return 0, err
+	}
+	defer out.Close()
+
+	enc := json.NewEncoder(out)
+	seen := make(map[string]struct{})
+
+	for _, lf := range logFiles {
+		f, e := os.Open(lf)
+		if e != nil {
+			continue
+		}
+		sc := bufio.NewScanner(f)
+		buf := make([]byte, 0, 64*1024)
+		sc.Buffer(buf, 16*1024*1024)
+		for sc.Scan() {
+			b := sc.Bytes()
+			if len(b) == 0 {
+				continue
+			}
+			var rec storage.RequestLog
+			if json.Unmarshal(b, &rec) != nil {
+				continue
+			}
+			if rec.Error != "" && rec.ResponseBody == nil && rec.AggregatedResponse == nil && !rec.Stream {
+				continue
+			}
+
+			row, ok := buildOpusTrainRow(&rec, streamIndex)
+			if !ok {
+				continue
+			}
+
+			// Dedup using problem content hash
+			content := ""
+			for _, msg := range row.Messages {
+				content += msg.Content
+			}
+			h := sha256.Sum256([]byte(content))
+			hashKey := hex.EncodeToString(h[:])
+			if len(hashKey) > 16 {
+				hashKey = hashKey[:16]
+			}
+			if _, exists := seen[hashKey]; exists {
+				continue
+			}
+			seen[hashKey] = struct{}{}
+
+			if err := enc.Encode(row); err != nil {
+				f.Close()
+				return n, err
+			}
+			n++
+		}
+		_ = f.Close()
+	}
+
+	if n == 0 {
+		_ = out.Close()
+		_ = os.Remove(outputPath)
+		return 0, nil
+	}
+	return n, nil
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// 4. 行业标准四目录数据集导出 (ExportDatasetDay)
 // ──────────────────────────────────────────────────────────────────────────────
 
 /*

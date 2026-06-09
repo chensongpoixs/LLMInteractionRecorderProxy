@@ -111,11 +111,11 @@ logging:
 daily_export:
   enable: true
   output_dir: "./exports"
-  file_prefix: "Opus-4.6-Reasoning-3000x-filtered-"
-  export_format: "dataset"    # "reasoning" / "messages" / "dataset" (prompts/responses/revisions/feedback)
+  file_prefix: "gpt-claude-gmini-"
+  export_format: "opus"    # "reasoning" / "messages" / "opus" (code_train.jsonl 格式, 保留多轮对话) / "dataset"
   run_hour: 0
   run_minute: 5
-  timezone: "Local"
+  timezone: "Asia/Shanghai"
 
 
 

@@ -341,6 +341,9 @@ func runDailyExport(ctx context.Context, cfg *config.Config, appLogger *logger.L
 				appLogger.Info("daily export (dataset): %d prompts, %d responses, %d revisions, %d feedback -> %s",
 					stats.Prompts, stats.Responses, stats.Revisions, stats.Feedback, exportPath)
 			}
+		case "opus":
+			exportPath = filepath.Join(outDir, prefix+y.Format("20060102")+".jsonl")
+			n, exportErr = exporter.ExportOpusTrainFormatDay(cfg.Storage.Directory, day, exportPath)
 		default:
 			exportPath = filepath.Join(outDir, prefix+y.Format("20060102")+".jsonl")
 			n, exportErr = exporter.ExportDay(cfg.Storage.Directory, day, exportPath)

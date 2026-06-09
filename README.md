@@ -480,12 +480,13 @@ func sandboxPath(workspace, userPath string) (string, error) {
 
 ## 7. 数据集导出系统
 
-### 7.1 三种导出格式
+### 7.1 四种导出格式
 
 | 格式 | 输出 | 过滤 | 去重 | 评分 | 适用场景 |
 |------|------|------|------|------|---------|
 | `reasoning` | 单个 `{prefix}YYYYMMDD.jsonl` | 无 | 无 | 无 | 推理链训练（Opus 4.6 风格） |
 | `messages` | 单个 `{prefix}YYYYMMDD.jsonl` | 无 | 无 | 无 | OpenAI 微调 API 直接使用 |
+| `opus` | 单个 `{prefix}YYYYMMDD.jsonl` | 基本 | SHA256 | 无 | 与 `code_train.jsonl` 参考格式对齐的训练集 |
 | `dataset` | 4 目录 + `metadata.csv` | 4 层质量控制 | SHA256 | 0-1 自动评分 | 全场景工业标准训练数据集 |
 
 ### 7.2 Dataset 格式（推荐）
@@ -503,7 +504,53 @@ exports/20260428/
 └── metadata.csv            # 聚合统计：total_records, filtered_out, by_language, by_model, avg_quality_score
 ```
 
-### 7.3 数据质量控制（dataset 格式）
+### 7.3 Opus 训练格式（完整多轮对话）
+
+与 `code_train.jsonl` 参考格式完全对齐，适用于 Claude Opus 训练数据集的导入。
+
+```
+exports/{prefix}YYYYMMDD.jsonl
+```
+
+每行 JSON 结构（含多轮对话示例）：
+
+```json
+{
+  "category": "coding",
+  "messages": [
+    {"role": "system", "content": "You are a computer science tutor..."},
+    {"role": "user", "content": "A triangle has sides of length 5, 12, and 13..."},
+    {"role": "assistant", "content": "<think>\n推理过程...\n</think>\n\n最终回答..."},
+    {"role": "user", "content": "What about a 3-4-5 triangle?"},
+    {"role": "assistant", "content": "<think>\n再次推理...\n</think>\n\n再次回答..."}
+  ],
+  "model": "claude-opus-4-6"
+}
+```
+
+> messages 字段**完整保留**客户端发送的所有历史对话轮次，而非仅最后一条 user + assistant 对。
+
+**字段说明**：
+
+| 字段 | 说明 |
+|------|------|
+| `category` | 任务分类映射：code → `"coding"`, math → `"math"`, general → `"general"` |
+| `messages` | **完整多轮对话**消息数组（system/user/assistant），按对话顺序排列 |
+| `model` | 使用的模型名称 |
+
+**Assistant content 格式**：
+- 若请求包含思考过程（reasoning/thinking），将其嵌入 `<think>...</think>` 标签内，后接最终回答
+- 若无思考过程，仅输出回答文本
+- 历史对话中的 assistant 如果有 reasoning，同样嵌入 `<think>` 标签
+
+**数据流**：
+1. 优先使用预追踪的 `rec.Messages` 链（完整的请求端多轮对话历史）
+2. 回退到通过 `storage.ExtractMessagesFromRequest()` 从请求体解析消息链
+3. 从代理响应数据中提取 thinking + solution（优先级：AggregatedResponse → ResponseBody → stream chunks）
+4. 拼接：请求端所有消息（含历史 assistant 的 reasoning）+ 当前响应作为最后一条 assistant
+5. SHA256 去重：基于所有消息内容拼接后的哈希值
+
+### 7.4 数据质量控制（dataset 格式）
 
 **4 层过滤**：
 1. **完整性** — 剔除有 error 且无 response_body 的记录（流式记录例外）
@@ -518,7 +565,7 @@ exports/20260428/
 - **难度推断** — 模型名关键词 + 回复长度启发式
 - **SHA256 去重** — `problem + thinking + solution` 的 SHA256 前 16 位 hex
 
-### 7.4 定时导出调度
+### 7.5 定时导出调度
 
 ```go
 // runDailyExport 后台循环
@@ -540,7 +587,7 @@ for {
 }
 ```
 
-### 7.5 Git 上传流程
+### 7.6 Git 上传流程
 
 ```
 syncRepo()
@@ -719,7 +766,7 @@ daily_export:
   enable: true
   output_dir: "./exports"
   file_prefix: "Opus-4.6-Reasoning-3000x-filtered-"  # reasoning/messages 格式用
-  export_format: "dataset"      # reasoning | messages | dataset
+  export_format: "dataset"      # reasoning | messages | opus | dataset
   run_hour: 0                   # 导出时刻（时）
   run_minute: 5                 # 导出时刻（分）
   timezone: "Asia/Shanghai"     # 时区
