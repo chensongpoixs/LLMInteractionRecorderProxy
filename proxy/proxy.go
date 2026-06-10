@@ -1604,6 +1604,9 @@ func (p *Proxy) handleAnthropicPassthroughStream(w http.ResponseWriter, r *http.
 		return
 	}
 
+	// Same request id for streams/*.jsonl chunks and final RequestLog row (matches handleStreaming).
+	streamReqID := "req_" + nextUniqueID()
+
 	streamBytes := 0
 	chunkCount := 0
 	aggregatedContent := ""
@@ -1620,13 +1623,25 @@ func (p *Proxy) handleAnthropicPassthroughStream(w http.ResponseWriter, r *http.
 		}
 		n, readErr := resp.Body.Read(buf)
 		if n > 0 {
-			w.Write(buf[:n])
+			chunkData := append([]byte(nil), buf[:n]...)
+			w.Write(chunkData)
 			flusher.Flush()
 			chunkCount++
 			streamBytes += n
 
+			streamChunk := &storage.ResponseStream{
+				ID:        streamReqID,
+				Chunk:     string(chunkData),
+				Timestamp: time.Now(),
+				SessionID: sessionID,
+				Index:     chunkCount,
+			}
+			if err := p.logger.SaveStreamChunk(streamChunk); err != nil && requestLogger != nil {
+				requestLogger.Warn("Anthropic passthrough SaveStreamChunk: %v", err)
+			}
+
 			// Parse SSE events to accumulate content and reasoning
-			sseBuf = append(sseBuf, buf[:n]...)
+			sseBuf = append(sseBuf, chunkData...)
 			for {
 				idx := bytes.IndexByte(sseBuf, '\n')
 				if idx < 0 {
@@ -1711,7 +1726,7 @@ func (p *Proxy) handleAnthropicPassthroughStream(w http.ResponseWriter, r *http.
 	// Extract conversation context for proper conversation grouping
 	conversationMessages, systemPrompt, turnIndex, conversationID := p.extractAndUpdateConversation(sessionID, anthropicReq, modelName)
 	// Log with full conversation context
-	p.logRequestFull(anthropicReq, conversationMessages, systemPrompt, sessionID, conversationID, turnIndex, modelName, "messages", start, resp.StatusCode, nil, aggregatedResponse, true, "", nil, requestLogger)
+	p.logRequestFull(anthropicReq, conversationMessages, systemPrompt, sessionID, conversationID, turnIndex, modelName, "messages", start, resp.StatusCode, nil, aggregatedResponse, true, "", nil, requestLogger, streamReqID)
 }
 
 // handleStreaming manages streaming responses
@@ -2016,9 +2031,16 @@ func (p *Proxy) logRequest(reqBody map[string]interface{}, modelName, endpoint s
 // logRequestFull 记录完整请求日志，包含对话上下文、聚合响应、token 统计。
 // @author chensong  @date 2026-04-26
 
-func (p *Proxy) logRequestFull(reqBody map[string]interface{}, messages []storage.MessageLog, systemPrompt, sessionID, conversationID string, turnIndex int, modelName, endpoint string, start time.Time, statusCode int, respBody []byte, aggregatedResponse map[string]interface{}, isStream bool, errorMsg string, tokensUsed map[string]int, requestLogger *logger.Logger) {
+// opts: optional request log id — pass non-empty so stream chunks in streams/ share the same id as this row.
+func (p *Proxy) logRequestFull(reqBody map[string]interface{}, messages []storage.MessageLog, systemPrompt, sessionID, conversationID string, turnIndex int, modelName, endpoint string, start time.Time, statusCode int, respBody []byte, aggregatedResponse map[string]interface{}, isStream bool, errorMsg string, tokensUsed map[string]int, requestLogger *logger.Logger, opts ...string) {
+	reqID := "req_" + nextUniqueID()
+	if len(opts) > 0 {
+		if s := strings.TrimSpace(opts[0]); s != "" {
+			reqID = s
+		}
+	}
 	reqLog := &storage.RequestLog{
-		ID:                 "req_" + nextUniqueID(),
+		ID:                 reqID,
 		Timestamp:          time.Now(),
 		SessionID:          sessionID,
 		ConversationID:     conversationID,
