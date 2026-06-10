@@ -202,10 +202,13 @@ func New(cfg *config.Config, storageLogger *storage.Logger, metrics *Metrics, ap
 	mux.HandleFunc("/v1/models", proxy.handleModels)
 	// Usage dashboard endpoints
 	mux.HandleFunc("/usage", proxy.handleUsageDashboard)
+	mux.HandleFunc("/static/", handleStatic)
 	mux.HandleFunc("/api/usage/summary", proxy.handler.HandleUsageSummary)
 	mux.HandleFunc("/api/usage/stream", proxy.handler.HandleUsageStream)
 	mux.HandleFunc("/api/prompts/dates", proxy.handler.HandlePromptDates)
 	mux.HandleFunc("/api/prompts", proxy.handler.HandlePromptList)
+	mux.HandleFunc("/api/prompts/conversations", proxy.handler.HandleConversations)
+	mux.HandleFunc("/api/prompts/conversation", proxy.handler.HandleConversationDetail)
 
 	// Agent chat endpoint (ReAct)
 	mux.HandleFunc("/api/chat/agent", proxy.handleAgentChat)
@@ -1300,6 +1303,125 @@ func (p *Proxy) handleAnthropicMessagesStream(w http.ResponseWriter, r *http.Req
 	p.logRequest(chatReq, modelName, "messages", start, resp.StatusCode, respBytes, true, "", usage, requestLogger)
 }
 
+// fixAnthropicThinkingBlocksForPassthrough 检查 Anthropic 请求中助手消息是否缺 thinking 块，
+// 从对话历史中注入缺失的 thinking 块。DeepSeek thinking 模式要求多轮对话中
+// content[].thinking 必须原样传回。
+// @author chensong  @date 2026-04-28
+func (p *Proxy) fixAnthropicThinkingBlocksForPassthrough(rawBody []byte, sessionID string) []byte {
+	var req map[string]interface{}
+	if err := json.Unmarshal(rawBody, &req); err != nil {
+		return rawBody
+	}
+	messages, ok := req["messages"].([]interface{})
+	if !ok || len(messages) == 0 {
+		return rawBody
+	}
+	// collect assistant messages missing thinking blocks
+	type missingInfo struct{ idx int }
+	var missing []missingInfo
+	for i, m := range messages {
+		msg, ok := m.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		role, _ := msg["role"].(string)
+		if role != "assistant" {
+			continue
+		}
+		if hasThinkingBlock(msg["content"]) {
+			continue
+		}
+		missing = append(missing, missingInfo{idx: i})
+	}
+	if len(missing) == 0 {
+		return rawBody
+	}
+	// reverse-match: last missing assistant gets last stored reasoning
+	history := p.getConversationHistory(sessionID)
+	var candidates []string
+	for i := len(history) - 1; i >= 0; i-- {
+		if history[i].Role == "assistant" && history[i].Reasoning != "" {
+			candidates = append(candidates, history[i].Reasoning)
+		}
+	}
+	for j, mi := range missing {
+		var reasoning string
+		ridx := len(candidates) - 1 - j
+		if ridx >= 0 {
+			reasoning = candidates[ridx]
+		}
+		// if no history available, use empty thinking block to satisfy
+		// DeepSeek validation that requires thinking blocks to exist
+		msg := messages[mi.idx].(map[string]interface{})
+		existing, _ := msg["content"].([]interface{})
+		if existing == nil {
+			existing = []interface{}{}
+		}
+		thinkingBlock := map[string]interface{}{
+			"type":     "thinking",
+			"thinking": reasoning,
+		}
+		newContent := make([]interface{}, 0, len(existing)+1)
+		newContent = append(newContent, thinkingBlock)
+		newContent = append(newContent, existing...)
+		msg["content"] = newContent
+	}
+	fixed, err := json.Marshal(req)
+	if err != nil {
+		return rawBody
+	}
+	return fixed
+}
+
+// hasThinkingBlock checks if Anthropic content array contains a thinking block.
+func hasThinkingBlock(content interface{}) bool {
+	arr, ok := content.([]interface{})
+	if !ok {
+		return false
+	}
+	for _, block := range arr {
+		if bm, ok := block.(map[string]interface{}); ok {
+			if typ, _ := bm["type"].(string); typ == "thinking" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// recordAnthropicPassthroughConversation extracts the assistant message from
+// an Anthropic-format response and stores it in the conversation tracker for
+// future thinking-block injection.
+// @author chensong  @date 2026-04-28
+func (p *Proxy) recordAnthropicPassthroughConversation(respParsed map[string]interface{}, sessionID string) {
+	var thinking, text string
+	if content, ok := respParsed["content"].([]interface{}); ok {
+		for _, block := range content {
+			bm, ok := block.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			typ, _ := bm["type"].(string)
+			switch typ {
+			case "thinking":
+				if t, ok := bm["thinking"].(string); ok {
+					thinking += t
+				}
+			case "text":
+				if t, ok := bm["text"].(string); ok {
+					text += t
+				}
+			}
+		}
+	}
+	assistantMsg := storage.MessageLog{
+		Role:      "assistant",
+		Content:   strings.TrimSpace(text),
+		Reasoning: strings.TrimSpace(thinking),
+	}
+	p.appendConversation(sessionID, nil, assistantMsg)
+}
+
 // handleAnthropicPassthrough forwards a raw Anthropic request directly to an
 // Anthropic-compatible upstream endpoint without any protocol conversion.
 // handleAnthropicPassthrough 将 Anthropic 请求直通转发（非流式）。
@@ -1307,8 +1429,19 @@ func (p *Proxy) handleAnthropicMessagesStream(w http.ResponseWriter, r *http.Req
 // @author chensong  @date 2026-04-26
 
 func (p *Proxy) handleAnthropicPassthrough(w http.ResponseWriter, r *http.Request, rawBody []byte, modelName, anthropicBase string, start time.Time, requestLogger *logger.Logger) {
+	sessionID := r.Header.Get("X-Session-ID")
+	if sessionID == "" {
+		sessionID = "session_" + modelName
+	}
+	// Parse request body for logging
+	var reqBody map[string]interface{}
+	if len(rawBody) > 0 {
+		json.Unmarshal(rawBody, &reqBody)
+	}
+	// inject missing thinking blocks for DeepSeek thinking mode
+	fixedBody := p.fixAnthropicThinkingBlocksForPassthrough(rawBody, sessionID)
 	targetURL := anthropicBase + "/messages"
-	proxyReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, targetURL, bytes.NewReader(rawBody))
+	proxyReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, targetURL, bytes.NewReader(fixedBody))
 	if err != nil {
 		requestLogger.Error("Failed to create Anthropic passthrough request: %v", err)
 		http.Error(w, "Failed to create proxy request", http.StatusInternalServerError)
@@ -1343,7 +1476,7 @@ func (p *Proxy) handleAnthropicPassthrough(w http.ResponseWriter, r *http.Reques
 			"Upstream call failed (anthropic passthrough): call_id=%s elapsed=%v err=%v",
 			upstreamCallID, time.Since(upstreamStart), err,
 		)
-		p.logRequest(nil, modelName, "messages", start, 500, nil, false, err.Error(), nil, requestLogger)
+		p.logRequestFull(reqBody, nil, "", sessionID, "", 0, modelName, "messages", start, 500, nil, nil, false, err.Error(), nil, requestLogger)
 		http.Error(w, "Proxy error: "+err.Error(), http.StatusBadGateway)
 		return
 	}
@@ -1360,7 +1493,7 @@ func (p *Proxy) handleAnthropicPassthrough(w http.ResponseWriter, r *http.Reques
 			return
 		}
 		requestLogger.Error("Failed to read anthropic passthrough response: %v", err)
-		p.logRequest(nil, modelName, "messages", start, resp.StatusCode, nil, false, err.Error(), nil, requestLogger)
+		p.logRequestFull(reqBody, nil, "", sessionID, "", 0, modelName, "messages", start, resp.StatusCode, nil, nil, false, err.Error(), nil, requestLogger)
 		http.Error(w, "Failed to read response", http.StatusBadGateway)
 		return
 	}
@@ -1370,8 +1503,10 @@ func (p *Proxy) handleAnthropicPassthrough(w http.ResponseWriter, r *http.Reques
 
 	var respParsed map[string]interface{}
 	json.Unmarshal(respBody, &respParsed)
+	// Extract conversation context and log with full context
+	conversationMessages, systemPrompt, turnIndex, conversationID := p.extractAndUpdateConversation(sessionID, reqBody, modelName)
 	tokensUsed := p.extractTokens(respParsed)
-	p.logRequest(nil, modelName, "messages", start, resp.StatusCode, respBody, false, "", tokensUsed, requestLogger)
+	p.logRequestFull(reqBody, conversationMessages, systemPrompt, sessionID, conversationID, turnIndex, modelName, "messages", start, resp.StatusCode, respBody, nil, false, "", tokensUsed, requestLogger)
 
 	w.Header().Set("Content-Type", resp.Header.Get("Content-Type"))
 	w.WriteHeader(resp.StatusCode)
@@ -1386,8 +1521,19 @@ func (p *Proxy) handleAnthropicPassthrough(w http.ResponseWriter, r *http.Reques
 // @author chensong  @date 2026-04-26
 
 func (p *Proxy) handleAnthropicPassthroughStream(w http.ResponseWriter, r *http.Request, rawBody []byte, modelName, anthropicBase string, start time.Time, requestLogger *logger.Logger) {
+	sessionID := r.Header.Get("X-Session-ID")
+	if sessionID == "" {
+		sessionID = fmt.Sprintf("session_%s_stream", modelName)
+	}
+	// Parse request body for logging
+	var reqBody map[string]interface{}
+	if len(rawBody) > 0 {
+		json.Unmarshal(rawBody, &reqBody)
+	}
+	// inject missing thinking blocks for DeepSeek thinking mode
+	fixedBody := p.fixAnthropicThinkingBlocksForPassthrough(rawBody, sessionID)
 	targetURL := anthropicBase + "/messages"
-	proxyReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, targetURL, bytes.NewReader(rawBody))
+	proxyReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, targetURL, bytes.NewReader(fixedBody))
 	if err != nil {
 		requestLogger.Error("Failed to create Anthropic passthrough stream request: %v", err)
 		http.Error(w, "Failed to create proxy request", http.StatusInternalServerError)
@@ -1423,7 +1569,7 @@ func (p *Proxy) handleAnthropicPassthroughStream(w http.ResponseWriter, r *http.
 			"Upstream call failed (anthropic passthrough stream): call_id=%s elapsed=%v err=%v",
 			upstreamCallID, time.Since(upstreamStart), err,
 		)
-		p.logRequest(nil, modelName, "messages", start, 500, nil, true, err.Error(), nil, requestLogger)
+		p.logRequest(reqBody, modelName, "messages", start, 500, nil, true, err.Error(), nil, requestLogger)
 		http.Error(w, "Proxy error: "+err.Error(), http.StatusBadGateway)
 		return
 	}
@@ -1458,6 +1604,9 @@ func (p *Proxy) handleAnthropicPassthroughStream(w http.ResponseWriter, r *http.
 		return
 	}
 
+	// Same request id for streams/*.jsonl chunks and final RequestLog row (matches handleStreaming).
+	streamReqID := "req_" + nextUniqueID()
+
 	streamBytes := 0
 	chunkCount := 0
 	aggregatedContent := ""
@@ -1474,13 +1623,25 @@ func (p *Proxy) handleAnthropicPassthroughStream(w http.ResponseWriter, r *http.
 		}
 		n, readErr := resp.Body.Read(buf)
 		if n > 0 {
-			w.Write(buf[:n])
+			chunkData := append([]byte(nil), buf[:n]...)
+			w.Write(chunkData)
 			flusher.Flush()
 			chunkCount++
 			streamBytes += n
 
+			streamChunk := &storage.ResponseStream{
+				ID:        streamReqID,
+				Chunk:     string(chunkData),
+				Timestamp: time.Now(),
+				SessionID: sessionID,
+				Index:     chunkCount,
+			}
+			if err := p.logger.SaveStreamChunk(streamChunk); err != nil && requestLogger != nil {
+				requestLogger.Warn("Anthropic passthrough SaveStreamChunk: %v", err)
+			}
+
 			// Parse SSE events to accumulate content and reasoning
-			sseBuf = append(sseBuf, buf[:n]...)
+			sseBuf = append(sseBuf, chunkData...)
 			for {
 				idx := bytes.IndexByte(sseBuf, '\n')
 				if idx < 0 {
@@ -1562,25 +1723,10 @@ func (p *Proxy) handleAnthropicPassthroughStream(w http.ResponseWriter, r *http.
 		}
 	}
 
-	sessionID := r.Header.Get("X-Session-ID")
-	if sessionID == "" {
-		sessionID = fmt.Sprintf("session_%s_stream", modelName)
-	}
-	reqLog := &storage.RequestLog{
-		ID:                 "req_" + nextUniqueID(),
-		Timestamp:          time.Now(),
-		SessionID:          sessionID,
-		Endpoint:           "messages",
-		Method:             "POST",
-		Model:              modelName,
-		Provider:           modelName,
-		RequestBody:        anthropicReq,
-		StatusCode:         resp.StatusCode,
-		Stream:             true,
-		Duration:           time.Since(start).String(),
-		AggregatedResponse: aggregatedResponse,
-	}
-	p.logger.SaveRequest(reqLog)
+	// Extract conversation context for proper conversation grouping
+	conversationMessages, systemPrompt, turnIndex, conversationID := p.extractAndUpdateConversation(sessionID, anthropicReq, modelName)
+	// Log with full conversation context
+	p.logRequestFull(anthropicReq, conversationMessages, systemPrompt, sessionID, conversationID, turnIndex, modelName, "messages", start, resp.StatusCode, nil, aggregatedResponse, true, "", nil, requestLogger, streamReqID)
 }
 
 // handleStreaming manages streaming responses
@@ -1830,26 +1976,16 @@ func (p *Proxy) getModelByProxyName(modelName string) *config.ModelConfig {
 	return nil
 }
 
-// translateModelNameInBody updates the model name in request body from proxy name to target model name.
-// Returns false if the model field is missing or not a string.
-// translateModelNameInBody 将请求体中的 proxy 模型名翻译为上游实际模型名。
+// translateModelNameInBody validates the model field in the request body.
+// The client-requested model name is forwarded to upstream as-is — no translation.
+// Returns false so the caller keeps the original body unchanged.
+// translateModelNameInBody 校验请求体中的 model 字段。
+// 客户端请求的模型名直接透传给上游，不再通过配置表翻译。
 // @author chensong  @date 2026-04-26
 
 func (p *Proxy) translateModelNameInBody(reqBody map[string]interface{}) bool {
-	modelRaw, exists := reqBody["model"]
-	if !exists {
-		return false
-	}
-	modelName, ok := modelRaw.(string)
-	if !ok {
-		return false
-	}
-	modelConfig := p.getModelByProxyName(modelName)
-	if modelConfig == nil {
-		return false
-	}
-	reqBody["model"] = modelConfig.ModelName
-	return true
+	// Client-requested model name is forwarded as-is, no config translation needed.
+	return false
 }
 
 // logRequest logs a request/response pair
@@ -1895,9 +2031,16 @@ func (p *Proxy) logRequest(reqBody map[string]interface{}, modelName, endpoint s
 // logRequestFull 记录完整请求日志，包含对话上下文、聚合响应、token 统计。
 // @author chensong  @date 2026-04-26
 
-func (p *Proxy) logRequestFull(reqBody map[string]interface{}, messages []storage.MessageLog, systemPrompt, sessionID, conversationID string, turnIndex int, modelName, endpoint string, start time.Time, statusCode int, respBody []byte, aggregatedResponse map[string]interface{}, isStream bool, errorMsg string, tokensUsed map[string]int, requestLogger *logger.Logger) {
+// opts: optional request log id — pass non-empty so stream chunks in streams/ share the same id as this row.
+func (p *Proxy) logRequestFull(reqBody map[string]interface{}, messages []storage.MessageLog, systemPrompt, sessionID, conversationID string, turnIndex int, modelName, endpoint string, start time.Time, statusCode int, respBody []byte, aggregatedResponse map[string]interface{}, isStream bool, errorMsg string, tokensUsed map[string]int, requestLogger *logger.Logger, opts ...string) {
+	reqID := "req_" + nextUniqueID()
+	if len(opts) > 0 {
+		if s := strings.TrimSpace(opts[0]); s != "" {
+			reqID = s
+		}
+	}
 	reqLog := &storage.RequestLog{
-		ID:                 "req_" + nextUniqueID(),
+		ID:                 reqID,
 		Timestamp:          time.Now(),
 		SessionID:          sessionID,
 		ConversationID:     conversationID,
