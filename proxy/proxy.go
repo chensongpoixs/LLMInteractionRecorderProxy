@@ -1611,6 +1611,7 @@ func (p *Proxy) handleAnthropicPassthroughStream(w http.ResponseWriter, r *http.
 	chunkCount := 0
 	aggregatedContent := ""
 	aggregatedReasoning := ""
+	passthroughTokens := map[string]int{} // accumulated token counts from SSE chunks
 
 	// SSE line buffer for partial reads across Read calls
 	var sseBuf []byte
@@ -1668,6 +1669,9 @@ func (p *Proxy) handleAnthropicPassthroughStream(w http.ResponseWriter, r *http.
 				if json.Unmarshal(data, &evt) != nil {
 					continue
 				}
+				// Accumulate token counts from this chunk
+				extractTokenFromChunk(passthroughTokens, evt)
+
 				delta, _ := evt["delta"].(map[string]interface{})
 				if delta == nil {
 					// Try OpenAI format: {"choices":[{"delta":{"content":"..."}}]}
@@ -1726,7 +1730,13 @@ func (p *Proxy) handleAnthropicPassthroughStream(w http.ResponseWriter, r *http.
 	// Extract conversation context for proper conversation grouping
 	conversationMessages, systemPrompt, turnIndex, conversationID := p.extractAndUpdateConversation(sessionID, anthropicReq, modelName)
 	// Log with full conversation context
-	p.logRequestFull(anthropicReq, conversationMessages, systemPrompt, sessionID, conversationID, turnIndex, modelName, "messages", start, resp.StatusCode, nil, aggregatedResponse, true, "", nil, requestLogger, streamReqID)
+	logReqBody := anthropicReq
+	logAggregated := aggregatedResponse
+	logTokens := passthroughTokens
+	if len(logTokens) > 0 {
+		requestLogger.Info("Passthrough stream tokens: %+v", logTokens)
+	}
+	p.logRequestFull(logReqBody, conversationMessages, systemPrompt, sessionID, conversationID, turnIndex, modelName, "messages", start, resp.StatusCode, nil, logAggregated, true, "", logTokens, requestLogger, streamReqID)
 }
 
 // handleStreaming manages streaming responses
@@ -1798,6 +1808,7 @@ func (p *Proxy) handleStreaming(w http.ResponseWriter, r *http.Request, proxyReq
 	totalBytes := 0
 	aggregatedContent := ""
 	aggregatedReasoning := ""
+	streamTokens := map[string]int{} // accumulated token counts from SSE chunks
 
 	scanner := make([]byte, 8192)
 	for {
@@ -1830,49 +1841,41 @@ func (p *Proxy) handleStreaming(w http.ResponseWriter, r *http.Request, proxyReq
 					continue
 				}
 				chunkToWrite := line
-				if bytes.HasPrefix(line, []byte("data:")) {
-					// Extract JSON data from SSE "data:" line
-					sseData := bytes.TrimSpace(bytes.TrimPrefix(line, []byte("data:")))
-					// Find the first { and last } to extract JSON
-					if idxStart := bytes.Index(sseData, []byte("{")); idxStart >= 0 {
-						if idxEnd := bytes.LastIndex(sseData, []byte("}")); idxEnd > idxStart {
-							jsonPart := sseData[idxStart : idxEnd+1]
-							normalized := p.normalizeStreamChunk(jsonPart)
-							if len(normalized) != len(jsonPart) {
-								chunkToWrite = append([]byte("data: "), normalized...)
-							}
-						}
-					}
-				} else if idxStart := bytes.Index(line, []byte("{")); idxStart >= 0 {
-					if idxEnd := bytes.LastIndex(line, []byte("}")); idxEnd > idxStart {
-						jsonPart := line[idxStart : idxEnd+1]
-						normalized := p.normalizeStreamChunk(jsonPart)
-						if len(normalized) != len(jsonPart) {
-							// Accumulate content and reasoning for aggregated response
-							if bytes.HasPrefix(chunkToWrite, []byte("data: ")) {
-								if jsonStart := bytes.Index(chunkToWrite[6:], []byte("{")); jsonStart >= 0 {
-									var sseChunk map[string]interface{}
-									if json.Unmarshal(chunkToWrite[6+jsonStart:], &sseChunk) == nil {
-										if choices, ok := sseChunk["choices"].([]interface{}); ok && len(choices) > 0 {
-											if c0, ok := choices[0].(map[string]interface{}); ok {
-												if delta, ok := c0["delta"].(map[string]interface{}); ok {
-													if c, ok := delta["content"].(string); ok {
-														aggregatedContent += c
-													}
-													if rc, ok := delta["reasoning_content"].(string); ok {
-														aggregatedReasoning += rc
-													}
-												}
-											}
-										}
+				// Try to extract JSON from this line for token and content accumulation
+				jsonBytes := extractJSONFromLine(line)
+				if jsonBytes != nil {
+					var sseChunk map[string]interface{}
+					if err := json.Unmarshal(jsonBytes, &sseChunk); err == nil {
+						// Accumulate token counts from every chunk
+						extractTokenFromChunk(streamTokens, sseChunk)
+						// Accumulate content and reasoning for aggregated response
+						if choices, ok := sseChunk["choices"].([]interface{}); ok && len(choices) > 0 {
+							if c0, ok := choices[0].(map[string]interface{}); ok {
+								if delta, ok := c0["delta"].(map[string]interface{}); ok {
+									if c, ok := delta["content"].(string); ok {
+										aggregatedContent += c
+									}
+									if rc, ok := delta["reasoning_content"].(string); ok {
+										aggregatedReasoning += rc
 									}
 								}
 							}
+						}
+					}
+				}
 
+				// Normalize JSON if needed (e.g., llama.cpp token field names)
+				if jsonBytes != nil {
+					normalized := p.normalizeStreamChunk(jsonBytes)
+					if len(normalized) != len(jsonBytes) {
+						if bytes.HasPrefix(line, []byte("data:")) {
+							chunkToWrite = append([]byte("data: "), normalized...)
+						} else {
 							chunkToWrite = normalized
 						}
 					}
 				}
+
 				w.Write(chunkToWrite)
 				w.Write([]byte("\n"))
 				w.(http.Flusher).Flush()
@@ -1908,7 +1911,7 @@ func (p *Proxy) handleStreaming(w http.ResponseWriter, r *http.Request, proxyReq
 			"choices": []interface{}{
 				map[string]interface{}{
 					"message": map[string]interface{}{
-						"content": aggregatedContent,
+						"content":           aggregatedContent,
 						"reasoning_content": aggregatedReasoning,
 					},
 				},
@@ -1916,11 +1919,16 @@ func (p *Proxy) handleStreaming(w http.ResponseWriter, r *http.Request, proxyReq
 		}
 	}
 
+	// Set accumulated token counts on reqLog
+	if len(streamTokens) > 0 {
+		reqLog.TokensUsed = streamTokens
+	}
+
 	// Finalize request log
 	reqLog.StatusCode = resp.StatusCode
 	reqLog.Duration = time.Since(start).String()
 	p.logger.SaveRequest(reqLog)
-	requestLogger.Info("Streaming request log saved")
+	requestLogger.Info("Streaming request log saved, tokens: %+v", streamTokens)
 }
 
 // getModelBaseURL returns the base URL for a model
@@ -2139,7 +2147,6 @@ func (p *Proxy) extractTokens(resp map[string]interface{}) map[string]int {
 	return tokens
 }
 
-// normalizeTokens converts response from llama.cpp format to Claude Code expected format
 // 1. Translates model name from actual filename to proxy model name
 // 2. Converts OpenAI token field names to llama.cpp field names (input_tokens/output_tokens)
 // 3. Removes llama.cpp timings object (replaced by usage)

@@ -46,6 +46,7 @@ import (
 	"time"
 
 	"proxy-llm/config"
+	"proxy-llm/storage"
 )
 
 // ===========================================================================
@@ -364,7 +365,11 @@ func (p *Proxy) handleAgentChat(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Connection", "keep-alive")
 	w.WriteHeader(http.StatusOK)
 
+	start := time.Now()
 	ctx := r.Context()
+
+	// Accumulate token usage across all LLM iterations
+	var totalUsageJSON []byte
 
 	agentCfg := p.config.Agent
 	maxIter := agentCfg.MaxIterations
@@ -414,10 +419,37 @@ func (p *Proxy) handleAgentChat(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// Call LLM (non-streaming for JSON parsing)
-		respBody, err := p.callLLM(ctx, modelCfg, messages)
+		respBody, usageJSON, err := p.callLLM(ctx, modelCfg, messages)
 		if err != nil {
 			sendError(fmt.Sprintf("LLM 调用失败: %v", err))
 			return
+		}
+
+		// Accumulate token usage from this iteration
+		if usageJSON != nil {
+			if totalUsageJSON == nil {
+				totalUsageJSON = usageJSON
+			} else {
+				// Merge: parse both and sum values
+				var curUsage map[string]interface{}
+				if json.Unmarshal(usageJSON, &curUsage) == nil {
+					var prevUsage map[string]interface{}
+					if json.Unmarshal(totalUsageJSON, &prevUsage) == nil {
+						for k, v := range curUsage {
+							prevVal, ok := prevUsage[k].(float64)
+							if !ok {
+								prevVal = 0
+							}
+							curVal, ok := v.(float64)
+							if !ok {
+								continue
+							}
+							prevUsage[k] = prevVal + curVal
+						}
+						totalUsageJSON, _ = json.Marshal(prevUsage)
+					}
+				}
+			}
 		}
 
 		// Parse the LLM JSON response
@@ -504,6 +536,36 @@ func (p *Proxy) handleAgentChat(w http.ResponseWriter, r *http.Request) {
 		)
 	}
 
+	// Log total token usage for the agent session
+	if totalUsageJSON != nil && p.logger != nil {
+		var usage map[string]interface{}
+		if json.Unmarshal(totalUsageJSON, &usage) == nil {
+			tokens := make(map[string]int)
+			for k, v := range usage {
+				if f, ok := v.(float64); ok {
+					tokens[k] = int(f)
+				}
+			}
+			reqLog := &storage.RequestLog{
+				ID:           "agent_req_" + nextUniqueID(),
+				Timestamp:    time.Now(),
+				SessionID:    "session_agent_" + req.Model,
+				Endpoint:     "agent/chat",
+				Method:       "POST",
+				Model:        req.Model,
+				Provider:     modelCfg.Name,
+				RequestBody:  map[string]interface{}{"message": req.Message, "iteration": maxIter},
+				StatusCode:   200,
+				Stream:       true,
+				Duration:     time.Since(start).String(),
+				TokensUsed:   tokens,
+			}
+			if err := p.logger.SaveRequest(reqLog); err != nil {
+				fmt.Fprintf(w, "event: error\ndata: %s\n\n", "Failed to save token log")
+			}
+		}
+	}
+
 	// Exceeded max iterations
 	sendError(fmt.Sprintf("已达到最大循环次数 (%d)，请简化请求或增加 max_iterations 配置", maxIter))
 }
@@ -580,7 +642,9 @@ func (p *Proxy) findModelConfig(name string) *config.ModelConfig {
  *   fmt.Println(content)
  * @endcode
  */
-func (p *Proxy) callLLM(ctx context.Context, modelCfg *config.ModelConfig, messages []map[string]interface{}) (string, error) {
+// callLLM calls the upstream LLM API and returns (content, usage, fullResponseBody, error).
+// usage is the raw JSON bytes of the "usage" object from the response.
+func (p *Proxy) callLLM(ctx context.Context, modelCfg *config.ModelConfig, messages []map[string]interface{}) (string, []byte, error) {
 	reqBody := map[string]interface{}{
 		"model":    modelCfg.ModelName,
 		"messages": messages,
@@ -589,13 +653,13 @@ func (p *Proxy) callLLM(ctx context.Context, modelCfg *config.ModelConfig, messa
 
 	bodyBytes, err := json.Marshal(reqBody)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 
 	url := strings.TrimRight(modelCfg.BaseURL, "/") + "/chat/completions"
 	httpReq, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(bodyBytes))
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Authorization", "Bearer "+modelCfg.APIKey)
@@ -607,34 +671,46 @@ func (p *Proxy) callLLM(ctx context.Context, modelCfg *config.ModelConfig, messa
 
 	resp, err := client.Do(httpReq)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	defer resp.Body.Close()
 
 	respBytes, err := io.ReadAll(io.LimitReader(resp.Body, 256*1024))
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(respBytes))
+		return "", nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(respBytes))
 	}
 
-	var result struct {
-		Choices []struct {
-			Message struct {
-				Content string `json:"content"`
-			} `json:"message"`
-		} `json:"choices"`
-	}
-	if err := json.Unmarshal(respBytes, &result); err != nil {
-		return "", fmt.Errorf("failed to parse LLM response: %w", err)
-	}
-	if len(result.Choices) == 0 {
-		return "", fmt.Errorf("empty response from LLM")
+	// Parse full response to extract both content and token usage
+	var respFull map[string]interface{}
+	if err := json.Unmarshal(respBytes, &respFull); err != nil {
+		return "", nil, fmt.Errorf("failed to parse LLM response: %w", err)
 	}
 
-	return result.Choices[0].Message.Content, nil
+	var content string
+	if choices, ok := respFull["choices"].([]interface{}); ok && len(choices) > 0 {
+		if c0, ok := choices[0].(map[string]interface{}); ok {
+			if msg, ok := c0["message"].(map[string]interface{}); ok {
+				if c, ok := msg["content"].(string); ok {
+					content = c
+				}
+			}
+		}
+	}
+	if content == "" {
+		return "", nil, fmt.Errorf("empty response from LLM")
+	}
+
+	// Extract usage object for token tracking
+	var usageJSON []byte
+	if usageRaw, ok := respFull["usage"]; ok && usageRaw != nil {
+		usageJSON, _ = json.Marshal(usageRaw)
+	}
+
+	return content, usageJSON, nil
 }
 
 // ===========================================================================
