@@ -30,24 +30,28 @@ func extractJSONFromLine(line []byte) []byte {
 
 // extractTokenFromChunk extracts token counts from a single SSE chunk (parsed JSON).
 // It accumulates into the provided tokens map (pass a new map on first call).
-// Handles both OpenAI format (prompt_tokens/completion_tokens) and
-// llama.cpp/Anthropic format (input_tokens/output_tokens).
+// Handles three formats:
+//   - OpenAI:   {"usage":{"prompt_tokens":N,"completion_tokens":M,"total_tokens":T}}
+//   - llama.cpp timings: {"timings":{"prompt_n":N,"predicted_n":M,"total":T}}
+//   - Anthropic: {"usage":{"input_tokens":N,"output_tokens":M}}
 //
 // @note  For each dimension (prompt/completion/total), only the first
 //       available field name is used to avoid double-counting when an
 //       upstream returns both canonical and legacy names.
 //
-// OpenAI:   {"usage":{"prompt_tokens":N,"completion_tokens":M,"total_tokens":T}}
-// llama.cpp:{"usage":{"input_tokens":N,"output_tokens":M,"total_tokens":T}}
-// Anthropic:{"usage":{"input_tokens":N,"output_tokens":M}}
+// @note  llama.cpp timings are read ONLY when usage is absent.
+//       In streaming, timings appear on EVERY chunk with cumulative counts.
+//       We accumulate them here; normalizeStreamChunk also converts timings->usage
+//       for the wire format, but that normalized copy is not fed back into
+//       this function, so direct timings handling is required.
 func extractTokenFromChunk(tokens map[string]int, chunk map[string]interface{}) {
 	if tokens == nil {
 		tokens = make(map[string]int)
 	}
+
+	// --- Path 1: Standard usage object (OpenAI / normalized llama.cpp) ---
 	if usageRaw, exists := chunk["usage"]; exists {
-		if u, ok := usageRaw.(map[string]interface{}); !ok {
-			return
-		} else {
+		if u, ok := usageRaw.(map[string]interface{}); ok {
 			// Prompt tokens: prefer prompt_tokens (OpenAI standard), fall back to input_tokens
 			if val, exists := u["prompt_tokens"]; exists {
 				if v, ok := asInt(val); ok {
@@ -70,6 +74,33 @@ func extractTokenFromChunk(tokens map[string]int, chunk map[string]interface{}) 
 			}
 			// Total tokens: only one canonical name
 			if val, exists := u["total_tokens"]; exists {
+				if v, ok := asInt(val); ok {
+					tokens["total_tokens"] += v
+				}
+			}
+			return // usage found — do not also read timings
+		}
+	}
+
+	// --- Path 2: llama.cpp raw timings (fallback when no usage object) ---
+	// llama.cpp streaming chunks carry cumulative token counts in timings:
+	//   {"timings":{"prompt_n":100.5,"predicted_n":50.2,"total":150.7,"prompt_per_second":0.98}}
+	if timingsRaw, exists := chunk["timings"]; exists {
+		if t, ok := timingsRaw.(map[string]interface{}); ok {
+			// prompt_n → prompt_tokens
+			if val, exists := t["prompt_n"]; exists {
+				if v, ok := asInt(val); ok {
+					tokens["prompt_tokens"] += v
+				}
+			}
+			// predicted_n → completion_tokens
+			if val, exists := t["predicted_n"]; exists {
+				if v, ok := asInt(val); ok {
+					tokens["completion_tokens"] += v
+				}
+			}
+			// total → total_tokens (if present as a number)
+			if val, exists := t["total"]; exists {
 				if v, ok := asInt(val); ok {
 					tokens["total_tokens"] += v
 				}
