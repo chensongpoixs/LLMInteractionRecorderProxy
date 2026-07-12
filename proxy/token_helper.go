@@ -1,20 +1,14 @@
-/******************************************************************************
- *  Copyright (c) 2025 The LLM Interaction Recorder & Proxy — 大模型交互日志与数据沉淀代理 project authors. All Rights Reserved.
- *
- *  Please visit https://chensongpoixs.github.io for detail
- *
- *  Use of this source code is governed by a BSD-style license
- *  that can be found in the LICENSE file in the root of the source
- *  tree. An additional intellectual property rights grant can be found in the
- *  PATENTS file in the root of the source tree.
- ******************************************************************************/
-
 package proxy
 
 import "bytes"
 
-// extractJSONFromLine 从一行文本中提取 JSON 部分（不含 data: 前缀）。
-// 如果行中包含 JSON 数据，返回字节切片；否则返回 nil。
+// extractJSONFromLine extracts a JSON object from a single SSE line.
+//
+// Handles the following input formats:
+// - "data: {"full JSON}""  →  {"full JSON"}
+// - "{"full JSON"}""       →  {"full JSON"}
+// Returns nil if no valid JSON object boundary ({…}) can be found.
+//
 // @author chensong @date 2026-07-13
 func extractJSONFromLine(line []byte) []byte {
 	// Strip "data:" prefix if present
@@ -23,7 +17,9 @@ func extractJSONFromLine(line []byte) []byte {
 		data = bytes.TrimSpace(bytes.TrimPrefix(line, []byte("data:")))
 	}
 
-	// Find first { and last } to extract JSON
+	// Find first { and last } to extract JSON.
+	// Note: In standard JSON, literal "}" inside string values is escaped as \},
+	// so using LastIndex on the raw bytes is safe for well-formed JSON.
 	if idxStart := bytes.Index(data, []byte("{")); idxStart >= 0 {
 		if idxEnd := bytes.LastIndex(data, []byte("}")); idxEnd > idxStart {
 			return data[idxStart : idxEnd+1]
@@ -80,5 +76,57 @@ func extractTokenFromChunk(tokens map[string]int, chunk map[string]interface{}) 
 			}
 		}
 	}
-	return
+}
+
+// normalizeTokenKeys 将不同上游的 token 字段名统一为 OpenAI 标准格式。
+//
+// 处理流程：
+//  1. 将 input_tokens 映射到 prompt_tokens（仅当 prompt_tokens 不存在时）
+//  2. 将 output_tokens 映射到 completion_tokens（仅当 completion_tokens 不存在时）
+//  3. 如果 total_tokens 为 0 且 prompt_tokens/completion_tokens 已知，则自动计算
+//
+// @param usage map[string]interface{} 原始 usage map，可能包含 input_tokens/output_tokens
+// @return map[string]int 规范化后的 token 统计 {prompt_tokens, completion_tokens, total_tokens}
+// @note 此函数不会修改输入的 usage map，而是返回一个新的 map
+func normalizeTokenKeys(usage map[string]interface{}) map[string]int {
+	tokens := make(map[string]int)
+	if usage == nil {
+		return tokens
+	}
+
+	// Extract prompt tokens: prefer prompt_tokens, fallback to input_tokens
+	if val, exists := usage["prompt_tokens"]; exists {
+		if v, ok := asInt(val); ok {
+			tokens["prompt_tokens"] = v
+		}
+	} else if val, exists := usage["input_tokens"]; exists {
+		if v, ok := asInt(val); ok {
+			tokens["prompt_tokens"] = v
+		}
+	}
+
+	// Extract completion tokens: prefer completion_tokens, fallback to output_tokens
+	if val, exists := usage["completion_tokens"]; exists {
+		if v, ok := asInt(val); ok {
+			tokens["completion_tokens"] = v
+		}
+	} else if val, exists := usage["output_tokens"]; exists {
+		if v, ok := asInt(val); ok {
+			tokens["completion_tokens"] = v
+		}
+	}
+
+	// Extract total_tokens if present
+	if val, exists := usage["total_tokens"]; exists {
+		if v, ok := asInt(val); ok {
+			tokens["total_tokens"] = v
+		}
+	}
+
+	// Auto-calculate total_tokens if missing
+	if tokens["total_tokens"] == 0 {
+		tokens["total_tokens"] = tokens["prompt_tokens"] + tokens["completion_tokens"]
+	}
+
+	return tokens
 }

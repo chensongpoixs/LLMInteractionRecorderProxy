@@ -1075,11 +1075,20 @@ func (p *Proxy) handleAnthropicMessagesStream(w http.ResponseWriter, r *http.Req
 
 		if usageRaw, exists := chunk["usage"]; exists {
 			if usageMap, ok := usageRaw.(map[string]interface{}); ok {
+				// Accumulate tokens from each chunk that carries usage data.
+				// Anthropic may send usage in message_start (input_tokens) and
+				// message_delta (output_tokens), so we use += rather than =.
 				if v, ok := asInt(usageMap["input_tokens"]); ok {
-					inputTokens = v
+					inputTokens += v
+				}
+				if v, ok := asInt(usageMap["prompt_tokens"]); ok {
+					inputTokens += v
 				}
 				if v, ok := asInt(usageMap["output_tokens"]); ok {
-					outputTokens = v
+					outputTokens += v
+				}
+				if v, ok := asInt(usageMap["completion_tokens"]); ok {
+					outputTokens += v
 				}
 			}
 		}
@@ -1818,6 +1827,9 @@ func (p *Proxy) handleStreaming(w http.ResponseWriter, r *http.Request, proxyReq
 			reqLog.Error = "client disconnected"
 			reqLog.StatusCode = 499
 			reqLog.Duration = time.Since(start).String()
+			if len(streamTokens) > 0 {
+				reqLog.TokensUsed = streamTokens
+			}
 			p.logger.SaveRequest(reqLog)
 			return
 		default:
@@ -2110,41 +2122,10 @@ func (p *Proxy) logRequestFull(reqBody map[string]interface{}, messages []storag
 // @author chensong  @date 2026-04-26
 
 func (p *Proxy) extractTokens(resp map[string]interface{}) map[string]int {
-	tokens := make(map[string]int)
-
-	if usage, exists := resp["usage"]; exists {
-		if u, ok := usage.(map[string]interface{}); ok {
-			// Extract prompt_tokens (OpenAI/llama.cpp) or input_tokens (llama.cpp legacy)
-			if val, exists := u["prompt_tokens"]; exists {
-				if v, ok := val.(float64); ok {
-					tokens["prompt_tokens"] = int(v)
-				}
-			}
-			if val, exists := u["input_tokens"]; exists {
-				if v, ok := val.(float64); ok {
-					tokens["prompt_tokens"] = int(v)
-				}
-			}
-			// Extract completion_tokens (OpenAI/llama.cpp) or output_tokens (llama.cpp legacy)
-			if val, exists := u["completion_tokens"]; exists {
-				if v, ok := val.(float64); ok {
-					tokens["completion_tokens"] = int(v)
-				}
-			}
-			if val, exists := u["output_tokens"]; exists {
-				if v, ok := val.(float64); ok {
-					tokens["completion_tokens"] = int(v)
-				}
-			}
-			if val, exists := u["total_tokens"]; exists {
-				if v, ok := val.(float64); ok {
-					tokens["total_tokens"] = int(v)
-				}
-			}
-		}
+	if resp == nil {
+		return make(map[string]int)
 	}
-
-	return tokens
+	return normalizeTokenKeys(resp)
 }
 
 // 1. Translates model name from actual filename to proxy model name

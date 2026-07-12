@@ -425,27 +425,28 @@ func (p *Proxy) handleAgentChat(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// Accumulate token usage from this iteration
+		// Accumulate token usage from this iteration.
+		// Normalize each iteration's usage to standard keys before merging
+		// to avoid the situation where one iteration returns input_tokens
+		// and another returns prompt_tokens, creating two independent keys.
 		if usageJSON != nil {
 			if totalUsageJSON == nil {
 				totalUsageJSON = usageJSON
 			} else {
-				// Merge: parse both and sum values
 				var curUsage map[string]interface{}
 				if json.Unmarshal(usageJSON, &curUsage) == nil {
 					var prevUsage map[string]interface{}
 					if json.Unmarshal(totalUsageJSON, &prevUsage) == nil {
-						for k, v := range curUsage {
-							prevVal, ok := prevUsage[k].(float64)
-							if !ok {
-								prevVal = 0
-							}
-							curVal, ok := v.(float64)
-							if !ok {
-								continue
-							}
-							prevUsage[k] = prevVal + curVal
+						curNorm := normalizeTokenKeys(curUsage)
+						prevNorm := normalizeTokenKeys(prevUsage)
+						for k, v := range curNorm {
+							prevNorm[k] += v
 						}
+						for k, v := range prevNorm {
+							prevUsage[k] = float64(v)
+						}
+						delete(prevUsage, "input_tokens")
+						delete(prevUsage, "output_tokens")
 						totalUsageJSON, _ = json.Marshal(prevUsage)
 					}
 				}
@@ -478,7 +479,7 @@ func (p *Proxy) handleAgentChat(w http.ResponseWriter, r *http.Request) {
 			}); err != nil {
 				return
 			}
-			sendSSE("done", agentDoneEvent{Iterations: iteration})
+			sendSSE("done", agentDoneEvent{Iterations: iteration, TokensUsed: totalUsageToMap(totalUsageJSON)})
 			return
 		}
 
@@ -490,7 +491,7 @@ func (p *Proxy) handleAgentChat(w http.ResponseWriter, r *http.Request) {
 			}); err != nil {
 				return
 			}
-			sendSSE("done", agentDoneEvent{Iterations: iteration})
+			sendSSE("done", agentDoneEvent{Iterations: iteration, TokensUsed: totalUsageToMap(totalUsageJSON)})
 			return
 		}
 
@@ -540,12 +541,9 @@ func (p *Proxy) handleAgentChat(w http.ResponseWriter, r *http.Request) {
 	if totalUsageJSON != nil && p.logger != nil {
 		var usage map[string]interface{}
 		if json.Unmarshal(totalUsageJSON, &usage) == nil {
-			tokens := make(map[string]int)
-			for k, v := range usage {
-				if f, ok := v.(float64); ok {
-					tokens[k] = int(f)
-				}
-			}
+			// Normalize token field names: input_tokens → prompt_tokens,
+			// output_tokens → completion_tokens, auto-calculate total_tokens.
+			tokens := normalizeTokenKeys(usage)
 			reqLog := &storage.RequestLog{
 				ID:           "agent_req_" + nextUniqueID(),
 				Timestamp:    time.Now(),
@@ -771,6 +769,21 @@ func extractJSON(text string) string {
 		}
 	}
 	return ""
+}
+
+// totalUsageToMap converts raw JSON bytes of a usage object into a map[string]int.
+// Returns nil if the input is nil or cannot be parsed.
+func totalUsageToMap(data []byte) map[string]int {
+	if data == nil {
+		return nil
+	}
+	var raw map[string]interface{}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return nil
+	}
+	// Normalize to standard field names before returning,
+	// in case raw still contains input_tokens/output_tokens.
+	return normalizeTokenKeys(raw)
 }
 
 // ===========================================================================
