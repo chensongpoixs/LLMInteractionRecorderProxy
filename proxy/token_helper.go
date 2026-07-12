@@ -34,34 +34,45 @@ func extractJSONFromLine(line []byte) []byte {
 
 // extractTokenFromChunk extracts token counts from a single SSE chunk (parsed JSON).
 // It accumulates into the provided tokens map (pass a new map on first call).
-// Handles both OpenAI format (usage.prompt_tokens) and llama.cpp (usage.input_tokens).
+// Handles both OpenAI format (prompt_tokens/completion_tokens) and
+// llama.cpp/Anthropic format (input_tokens/output_tokens).
+//
+// @note  For each dimension (prompt/completion/total), only the first
+//       available field name is used to avoid double-counting when an
+//       upstream returns both canonical and legacy names.
+//
+// OpenAI:   {"usage":{"prompt_tokens":N,"completion_tokens":M,"total_tokens":T}}
+// llama.cpp:{"usage":{"input_tokens":N,"output_tokens":M,"total_tokens":T}}
+// Anthropic:{"usage":{"input_tokens":N,"output_tokens":M}}
 func extractTokenFromChunk(tokens map[string]int, chunk map[string]interface{}) {
 	if tokens == nil {
 		tokens = make(map[string]int)
 	}
-	// OpenAI format: {"usage": {"prompt_tokens": N, "completion_tokens": M, "total_tokens": T}}
 	if usageRaw, exists := chunk["usage"]; exists {
-		if u, ok := usageRaw.(map[string]interface{}); ok {
+		if u, ok := usageRaw.(map[string]interface{}); !ok {
+			return
+		} else {
+			// Prompt tokens: prefer prompt_tokens (OpenAI standard), fall back to input_tokens
 			if val, exists := u["prompt_tokens"]; exists {
 				if v, ok := asInt(val); ok {
 					tokens["prompt_tokens"] += v
 				}
-			}
-			if val, exists := u["input_tokens"]; exists {
+			} else if val, exists := u["input_tokens"]; exists {
 				if v, ok := asInt(val); ok {
 					tokens["prompt_tokens"] += v
 				}
 			}
+			// Completion tokens: prefer completion_tokens (OpenAI standard), fall back to output_tokens
 			if val, exists := u["completion_tokens"]; exists {
 				if v, ok := asInt(val); ok {
 					tokens["completion_tokens"] += v
 				}
-			}
-			if val, exists := u["output_tokens"]; exists {
+			} else if val, exists := u["output_tokens"]; exists {
 				if v, ok := asInt(val); ok {
 					tokens["completion_tokens"] += v
 				}
 			}
+			// Total tokens: only one canonical name
 			if val, exists := u["total_tokens"]; exists {
 				if v, ok := asInt(val); ok {
 					tokens["total_tokens"] += v
