@@ -2125,7 +2125,13 @@ func (p *Proxy) extractTokens(resp map[string]interface{}) map[string]int {
 	if resp == nil {
 		return make(map[string]int)
 	}
-	return normalizeTokenKeys(resp)
+	// Extract the usage object from the response
+	if usageRaw, exists := resp["usage"]; exists {
+		if u, ok := usageRaw.(map[string]interface{}); ok {
+			return normalizeTokenKeys(u)
+		}
+	}
+	return make(map[string]int)
 }
 
 // 1. Translates model name from actual filename to proxy model name
