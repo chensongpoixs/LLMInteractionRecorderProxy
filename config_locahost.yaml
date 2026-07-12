@@ -1,0 +1,177 @@
+# =============================================================================
+# Proxy LLM 配置文件
+# =============================================================================
+#
+# 本代理支持两种上游 API 格式：
+#   1. OpenAI 兼容 API    → 使用 base_url，请求路径如 /v1/chat/completions
+#   2. Anthropic 兼容 API  → 使用 base_url_anthropic，请求路径如 /v1/messages
+#
+# 当模型同时配置了两套 base_url 时：
+#   - 客户端发往 /v1/chat/completions → 使用 base_url（OpenAI 格式透传）
+#   - 客户端发往 /v1/messages          → 使用 base_url_anthropic（Anthropic 格式透传）
+#
+# 如果只配置了 base_url（未配置 base_url_anthropic）：
+#   - /v1/messages 会自动转换为 OpenAI 格式后发往 base_url（兼容模式）
+#
+# ⚠️ llama.cpp / vllm / 其他仅支持 OpenAI 协议的上游：
+#   - 只配置 base_url，不要配置 base_url_anthropic
+#   - 如果 base_url_anthropic 与 base_url 相同，自动回退到 OpenAI 转换模式
+#   - 否则 /v1/messages 会直接转发到上游 /messages 端点（404 错误）
+#
+# base_url 说明：
+#   - 对于 OpenAI 兼容的上游（如 vllm, llama.cpp）：
+#     base_url = "http://host:port/v1"（包含 /v1 前缀）
+#   - 对于 OpenAI 官方 API：
+#     base_url = "https://api.openai.com"（不包含 /v1 前缀）
+
+server:
+  host: "0.0.0.0"
+  port: 20901
+  # tls_cert: ""  # TLS 证书路径（可选）
+  # tls_key: ""   # TLS 密钥路径（可选）
+
+# =============================================================================
+# LLM 模型配置
+# =============================================================================
+# 每个模型可配置两套独立的 base_url：
+#   base_url           - OpenAI 兼容端点（/v1/chat/completions, /v1/models 等）
+#   base_url_anthropic - Anthropic 兼容端点（/v1/messages）
+#
+# DeepSeek API 示例：
+#   OpenAI 兼容端点:    https://api.deepseek.com
+#   Anthropic 兼容端点: https://api.deepseek.com/anthropic
+#   模型名: deepseek-v4-pro / deepseek-v4-flash
+models:
+  - name: "vllm"
+    #base_url: "https://api.deepseek.com"              # OpenAI 兼容端点
+    base_url: "http://172.29.240.192:11000"
+    base_url_anthropic: "http://172.29.240.192:11000/v1"
+    #base_url_anthropic: "https://api.deepseek.com/anthropic"  # Anthropic 兼容端点
+    api_key: "sk-27dd1f7c555e4a3ba88b9435414fba32"                    # 使用环境变量
+    # model: "deepseek-v4-pro"
+    #model: "deepseek-v4-flash"
+    model: "TinySage-4B"
+    timeout: 90000s
+    max_retries: 3
+
+  # 仅 OpenAI 兼容的模型（无 Anthropic 端点）示例：
+  # - name: "qwen3.6"
+  #   base_url: "http://js1.blockelite.cn:57700/v1"
+  #   api_key: "sk-not-required"
+  #   model: "qwen3.6-35b-a3b-claude-4.6-opus-reasoning-distilled.q8_0"
+  #   timeout: 300s
+  #   max_retries: 3
+
+  # llama.cpp 本地模型示例：
+  # - name: "local-llama"
+  #   base_url: "http://127.0.0.1:11434/v1"
+  #   api_key: "sk-not-required"
+  #   model: "gemma-4-26B-A4B-it-Q4_K_M"
+  #   timeout: 300s
+  #   max_retries: 3
+  #   llama_api: "/v1/api/chat"
+
+# =============================================================================
+# 存储配置
+# =============================================================================
+storage:
+  directory: "./data"
+  format: "jsonl"       # jsonl 或 json
+  compress: false       # 是否 gzip 压缩
+  rotate: "daily"       # daily / weekly / size
+  max_size: "100mb"
+
+# =============================================================================
+# 代理行为配置
+# =============================================================================
+proxy:
+  enable_stream: true
+  max_body_size: "10mb"
+  rate_limit: 0         # 0 = 不限制
+  enable_cors: true
+  allowed_origins:
+    - "*"
+  enable_auth: false
+  auth_header: "X-API-Key"
+  auth_token: ""
+
+# =============================================================================
+# 监控配置
+# =============================================================================
+monitoring:
+  enable_health: true
+  enable_metrics: true
+  metrics_path: "/metrics"
+
+# =============================================================================
+# 日志配置
+# =============================================================================
+logging:
+  level: "debug"              # debug / info / warn / error
+  file: "./logs/app.log"
+  max_size_mb: 100
+  max_backups: 10
+  max_age_days: 30
+  compress: true
+  console: true
+  request_log: true
+  request_body_log: true
+  response_body_log: true
+  upstream_http_log: true     # 打印客户端→代理→上游 完整 HTTP 信息
+  upstream_log_max_bytes: 262144   # 0 = 256 KiB
+
+# =============================================================================
+# 每日导出配置
+# =============================================================================
+daily_export:
+  enable: true
+  output_dir: "./exports"
+  file_prefix: "Opus-4.6-Reasoning-3000x-filtered-"
+  export_format: "dataset"    # "reasoning" / "messages" / "dataset" (prompts/responses/revisions/feedback)
+  run_hour: 0
+  run_minute: 5
+  timezone: "Local"
+
+# =============================================================================
+# ModelScope 数据集自动上传配置
+# =============================================================================
+# 每天凌晨导出完成后，通过 Git 将数据自动推送至 ModelScope 数据集仓库。
+# 前提条件：
+#   1. 在 https://modelscope.cn 上创建数据集仓库
+#   2. 获取 Git 访问令牌：https://modelscope.cn/my/myaccesstoken
+#   3. repo_url 格式：https://oauth2:TOKEN@www.modelscope.cn/datasets/USER/REPO.git
+modelscope:
+  enable: true
+  repo_url: "https://oauth2:TOKEN@www.modelscope.cn/datasets/chensongpoixs/llm_interaction_corpus.git"
+  repo_dir: "./modelscope_repo"
+  git_user: "chensongpoixs"
+  git_email: "15850774503@163.com"
+  data_subdir: "data"
+  upload_delay: 10
+  git_branch: "master"
+
+# =============================================================================
+# HuggingFace 数据集自动上传配置
+# =============================================================================
+# 每天凌晨导出完成后，通过 Git 将数据自动推送至 HuggingFace 数据集仓库。
+# 前提条件：
+#   1. 在 https://huggingface.co 上创建数据集仓库
+#   2. 获取 HuggingFace Access Token：https://huggingface.co/settings/tokens
+#   3. repo_url 格式：https://USER:TOKEN@huggingface.co/datasets/USER/REPO.git
+huggingface:
+  enable: true
+  repo_url: "https://USER:TOKEN@huggingface.co/datasets/USER/REPO.git"
+  repo_dir: "./huggingface_repo"
+  git_user: "chensongpoixs"
+  git_email: "15850774503@163.com"
+  data_subdir: "data"
+  upload_delay: 15
+  git_branch: "main"
+
+# =============================================================================
+# Agent / ReAct 配置
+# =============================================================================
+agent:
+  workspace_dir: "./agent_workspace"
+  max_iterations: 15
+  bash_timeout: 30

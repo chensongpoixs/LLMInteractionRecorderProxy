@@ -126,6 +126,81 @@
 
           <div class="card">
             <div class="card-title">
+              <span>每日 Token 用量明细</span>
+              <span class="badge">{{ summary.daily.length }} 天</span>
+            </div>
+            <div class="table-wrap" v-if="summary.daily.length > 0">
+              <table>
+                <thead>
+                  <tr>
+                    <th>日期</th>
+                    <th style="text-align:right">请求数</th>
+                    <th style="text-align:right">Input Tokens</th>
+                    <th style="text-align:right">Output Tokens</th>
+                    <th style="text-align:right">Total Tokens</th>
+                    <th style="text-align:right">费用 (USD)</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr v-for="d in sortedDaily" :key="d.date" style="cursor:pointer;" @click="toggleDailyRow(d)" :class="{ 'daily-expanded': d._expanded }">
+                    <td style="font-weight:500;">{{ d.date }}</td>
+                    <td style="text-align:right">{{ fmtInt(d.requests) }}</td>
+                    <td style="text-align:right;color:var(--input-color)">{{ fmtInt(d.prompt_tokens) }}</td>
+                    <td style="text-align:right;color:var(--output-color)">{{ fmtInt(d.completion_tokens) }}</td>
+                    <td style="text-align:right;font-weight:500;">{{ fmtInt(d.total_tokens) }}</td>
+                    <td style="text-align:right;color:var(--text-secondary)">${{ d.estimated_cost_usd.toFixed(4) }}</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+            <div v-else class="empty-state">暂无每日数据</div>
+
+            <!-- 每日详情展开面板 -->
+            <div v-if="expandedDaily" class="daily-detail-panel">
+              <div class="daily-detail-header">
+                <span style="font-weight:600;">{{ expandedDaily.date }} 详情</span>
+                <button class="btn-sm" @click="expandedDaily = null" style="margin-left:auto;">✕ 关闭</button>
+              </div>
+              <div class="daily-detail-body">
+                <!-- 当日模型分布 -->
+                <div class="detail-section" v-if="getModelDailyData(expandedDaily.date).length > 0">
+                  <div class="detail-section-title">按模型分布</div>
+                  <div class="model-daily-list">
+                    <div class="model-daily-row" v-for="md in getModelDailyData(expandedDaily.date)" :key="md.model">
+                      <span class="name">{{ shortModel(md.model) }}</span>
+                      <span class="tokens">{{ fmtInt(md.total_tokens) }} tokens</span>
+                    </div>
+                  </div>
+                </div>
+                <div class="detail-section" v-if="getTokenDailyBreakdown(expandedDaily.date).length > 0">
+                  <div class="detail-section-title">Token 使用明细（按模型）</div>
+                  <div class="table-wrap">
+                    <table>
+                      <thead>
+                        <tr>
+                          <th>模型</th>
+                          <th style="text-align:right">Input</th>
+                          <th style="text-align:right">Output</th>
+                          <th style="text-align:right">Total</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        <tr v-for="bd in getTokenDailyBreakdown(expandedDaily.date)" :key="bd.model">
+                          <td><span class="model-tag">{{ shortModel(bd.model) }}</span></td>
+                          <td style="text-align:right;color:var(--input-color)">{{ fmtInt(bd.prompt_tokens) }}</td>
+                          <td style="text-align:right;color:var(--output-color)">{{ fmtInt(bd.completion_tokens) }}</td>
+                          <td style="text-align:right;font-weight:500;">{{ fmtInt(bd.total_tokens) }}</td>
+                        </tr>
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-title">
               <span>Models</span>
               <span class="badge">{{ summary.by_model.length }}</span>
             </div>

@@ -1937,17 +1937,38 @@ func (p *Proxy) getModelBaseURL(modelName string) string {
 }
 
 // getModelBaseURLAnthropic returns the Anthropic-compatible base URL for a model.
-// Returns empty string if not configured (caller should fall back to OpenAI conversion path).
+// Returns empty string if not configured, or if base_url_anthropic is the same as
+// base_url (which indicates the upstream does not support Anthropic protocol and
+// requests should fall back to the OpenAI conversion path).
 // getModelBaseURLAnthropic 查找模型对应的 Anthropic 兼容 Base URL。
 // @author chensong  @date 2026-04-26
 
 func (p *Proxy) getModelBaseURLAnthropic(modelName string) string {
 	for _, model := range p.config.Models {
 		if model.Name == modelName {
+			// If base_url_anthropic is not set, return empty
+			if model.BaseURLAnthropic == "" {
+				return ""
+			}
+			// If base_url_anthropic is identical to base_url, the upstream likely
+			// does not support Anthropic protocol. Return empty so the caller falls
+			// back to the OpenAI conversion path instead of sending Anthropic-format
+			// requests to a server that only understands OpenAI format.
+			if model.BaseURLAnthropic == model.BaseURL {
+				return ""
+			}
 			return model.BaseURLAnthropic
 		}
 	}
-	return p.config.Models[0].BaseURLAnthropic
+	// Fallback to first model
+	if len(p.config.Models) > 0 {
+		first := p.config.Models[0]
+		if first.BaseURLAnthropic == "" || first.BaseURLAnthropic == first.BaseURL {
+			return ""
+		}
+		return first.BaseURLAnthropic
+	}
+	return ""
 }
 
 // getAPIKey returns the API key for a model

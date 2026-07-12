@@ -21,6 +21,7 @@ createApp({
       selectedConv: null, selectedConvId: null,
       convDetailLoading: false, collapsedThinking: {},
       toast: { show: false, message: '', type: 'success' },
+      expandedDaily: null,
       // Agent tab state
       agentModel: '', agentModels: [],
       agentTools: { bash: true, read_file: true, write_file: true, grep: true, glob: true },
@@ -42,6 +43,11 @@ createApp({
     },
     chartMax() {
       return (this.summary.daily || []).reduce((m, p) => Math.max(m, p.total_tokens || 0), 0) || 1;
+    },
+    // Daily table: sort by date descending (newest first)
+    sortedDaily() {
+      const list = this.summary.daily || [];
+      return list.slice().sort((a, b) => (b.date || '').localeCompare(a.date || ''));
     },
   },
   methods: {
@@ -87,6 +93,24 @@ createApp({
     stopStream() { if (this.stream) { this.stream.close(); this.stream = null; } },
     toggleStreamMode() { this.streamMode = !this.streamMode; if (this.streamMode) { this.stopAutoRefresh(); this.startStream(); } else { this.stopStream(); this.startAutoRefresh(); } },
     onDaysChange() { this.load().catch(console.error); if (this.streamMode) { this.stopStream(); this.startStream(); } },
+
+    // === Daily token table ===
+    toggleDailyRow(d) {
+      if (this.expandedDaily === d) {
+        this.expandedDaily = null;
+      } else {
+        this.expandedDaily = d;
+      }
+    },
+    getModelDailyData(day) {
+      // Find the day in sortedDaily and return its by_model
+      if (!day) return [];
+      const found = (this.summary.daily || []).find(d => d.date === day);
+      return found?.by_model || [];
+    },
+    getTokenDailyBreakdown(day) {
+      return this.getModelDailyData(day);
+    },
 
     // === Export tab ===
     showToast(msg, type) {

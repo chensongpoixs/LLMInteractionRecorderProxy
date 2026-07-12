@@ -81,12 +81,23 @@ type Handler struct {
 // @date   2026-04-26
 // @brief 按日期维度的用量聚合数据
 type usageDailyPoint struct {
-	Date             string  `json:"date"`              ///< 日期字符串，格式 YYYY-MM-DD
-	Requests         int     `json:"requests"`          ///< 当日请求总数
-	PromptTokens     int64   `json:"prompt_tokens"`     ///< 当日输入 Token 总数
-	CompletionTokens int64   `json:"completion_tokens"` ///< 当日输出 Token 总数
-	TotalTokens      int64   `json:"total_tokens"`      ///< 当日 Token 总数（输入+输出）
-	EstimatedCostUSD float64 `json:"estimated_cost_usd"` ///< 当日估算费用（美元），保留两位小数
+	Date             string            `json:"date"`              ///< 日期字符串，格式 YYYY-MM-DD
+	Requests         int               `json:"requests"`          ///< 当日请求总数
+	PromptTokens     int64             `json:"prompt_tokens"`     ///< 当日输入 Token 总数
+	CompletionTokens int64             `json:"completion_tokens"` ///< 当日输出 Token 总数
+	TotalTokens      int64             `json:"total_tokens"`      ///< 当日 Token 总数（输入+输出）
+	EstimatedCostUSD float64           `json:"estimated_cost_usd"` ///< 当日估算费用（美元），保留两位小数
+	ByModel          []usageDailyModel `json:"by_model,omitempty"` ///< 当日按模型的 token 细分
+}
+
+// usageDailyModel 表示单日某模型的 token 用量。
+type usageDailyModel struct {
+	Model            string  `json:"model"`             ///< 模型名称
+	Requests         int     `json:"requests"`          ///< 该模型当日请求数
+	PromptTokens     int64   `json:"prompt_tokens"`     ///< 该模型当日输入 Token
+	CompletionTokens int64   `json:"completion_tokens"` ///< 该模型当日输出 Token
+	TotalTokens      int64   `json:"total_tokens"`      ///< 该模型当日总 Token
+	EstimatedCostUSD float64 `json:"estimated_cost_usd"` ///< 该模型当日估算费用
 }
 
 // usageModelPoint 表示单个模型的用量聚合数据点。
@@ -714,9 +725,17 @@ func (h *Handler) buildUsageSummary(days int) (usageSummaryResponse, error) {
 		total      int64
 		cost       float64
 	}
+	type dayModelAgg struct {
+		requests   int
+		prompt     int64
+		completion int64
+		total      int64
+		cost       float64
+	}
 
 	dayMap := make(map[string]*dayAgg)
 	modelMap := make(map[string]*modelAgg)
+	dayModelMap := make(map[string]map[string]*dayModelAgg) // date -> model -> agg
 	recent := make([]usageRecentItem, 0, 64)
 
 	var totalRequests, successRequests int
@@ -760,6 +779,12 @@ func (h *Handler) buildUsageSummary(days int) (usageSummaryResponse, error) {
 			cost := estimateCostUSD(rec.Model, prompt, completion)
 			dateKey := ts.Format("2006-01-02")
 
+			// Normalize model key
+			modelKey := rec.Model
+			if strings.TrimSpace(modelKey) == "" {
+				modelKey = "unknown"
+			}
+
 			totalRequests++
 			if rec.StatusCode > 0 && rec.StatusCode < 400 {
 				successRequests++
@@ -779,10 +804,19 @@ func (h *Handler) buildUsageSummary(days int) (usageSummaryResponse, error) {
 			dayMap[dateKey].total += total
 			dayMap[dateKey].cost += cost
 
-			modelKey := rec.Model
-			if strings.TrimSpace(modelKey) == "" {
-				modelKey = "unknown"
+			// Per-day per-model aggregation
+			if dayModelMap[dateKey] == nil {
+				dayModelMap[dateKey] = make(map[string]*dayModelAgg)
 			}
+			if _, ok := dayModelMap[dateKey][modelKey]; !ok {
+				dayModelMap[dateKey][modelKey] = &dayModelAgg{}
+			}
+			dayModelMap[dateKey][modelKey].requests++
+			dayModelMap[dateKey][modelKey].prompt += prompt
+			dayModelMap[dateKey][modelKey].completion += completion
+			dayModelMap[dateKey][modelKey].total += total
+			dayModelMap[dateKey][modelKey].cost += cost
+
 			if _, ok := modelMap[modelKey]; !ok {
 				modelMap[modelKey] = &modelAgg{}
 			}
@@ -808,6 +842,22 @@ func (h *Handler) buildUsageSummary(days int) (usageSummaryResponse, error) {
 
 	daily := make([]usageDailyPoint, 0, len(dayMap))
 	for d, v := range dayMap {
+		// Build per-model breakdown for this day
+		var byModel []usageDailyModel
+		if dm, ok := dayModelMap[d]; ok {
+			for m, dmv := range dm {
+				byModel = append(byModel, usageDailyModel{
+					Model:            m,
+					Requests:         dmv.requests,
+					PromptTokens:     dmv.prompt,
+					CompletionTokens: dmv.completion,
+					TotalTokens:      dmv.total,
+					EstimatedCostUSD: round2(dmv.cost),
+				})
+			}
+			// Sort by total tokens descending
+			sort.Slice(byModel, func(i, j int) bool { return byModel[i].TotalTokens > byModel[j].TotalTokens })
+		}
 		daily = append(daily, usageDailyPoint{
 			Date:             d,
 			Requests:         v.requests,
@@ -815,6 +865,7 @@ func (h *Handler) buildUsageSummary(days int) (usageSummaryResponse, error) {
 			CompletionTokens: v.completion,
 			TotalTokens:      v.total,
 			EstimatedCostUSD: round2(v.cost),
+			ByModel:          byModel,
 		})
 	}
 	sort.Slice(daily, func(i, j int) bool { return daily[i].Date < daily[j].Date })

@@ -238,6 +238,63 @@ tr:hover td { background: rgba(255,255,255,0.02); }
 @keyframes shimmer { 0% { transform: translateX(-100%); } 100% { transform: translateX(100%); } }
 .empty-state { text-align: center; padding: 40px 20px; color: var(--text-muted); font-size: 14px; }
 
+/* Daily token detail table */
+.daily-expanded td { background: rgba(108,140,255,0.04); }
+
+.daily-detail-panel {
+  margin-top: 12px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  overflow: hidden;
+  background: var(--card);
+}
+.daily-detail-header {
+  display: flex;
+  align-items: center;
+  padding: 10px 16px;
+  background: var(--bg);
+  border-bottom: 1px solid var(--line);
+  font-size: 13px;
+}
+.daily-detail-body {
+  padding: 14px 16px 16px;
+}
+.detail-section {
+  margin-bottom: 14px;
+}
+.detail-section:last-child {
+  margin-bottom: 0;
+}
+.detail-section-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  margin-bottom: 8px;
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+}
+.model-daily-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.model-daily-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 12px;
+  background: var(--bg);
+  border-radius: 6px;
+  font-size: 12px;
+}
+.model-daily-row .name {
+  font-weight: 500;
+  color: var(--text);
+}
+.model-daily-row .tokens {
+  color: var(--text-secondary);
+}
+
 /* === Conversation Browser: DeepSeek-style === */
 .conv-layout {
   display: grid; grid-template-columns: 280px 1fr; gap: 0;
