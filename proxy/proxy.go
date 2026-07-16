@@ -759,7 +759,10 @@ func (p *Proxy) handleAnthropicMessages() http.HandlerFunc {
 				"Upstream call failed: call_id=%s endpoint=messages elapsed=%v err=%v",
 				upstreamCallID, time.Since(upstreamStart), err,
 			)
-			p.logRequest(chatReq, modelName, "messages", start, 500, nil, false, err.Error(), nil, requestLogger)
+			// Extract conversation context and log with full context
+			sessionID := fmt.Sprintf("session_%s", modelName)
+			conversationMessages, systemPrompt, turnIndex, conversationID := p.extractAndUpdateConversation(sessionID, anthropicReq, modelName)
+			p.logRequestFull(anthropicReq, conversationMessages, systemPrompt, sessionID, conversationID, turnIndex, modelName, "messages", start, 500, nil, nil, false, err.Error(), nil, requestLogger)
 			http.Error(w, "Proxy error: "+err.Error(), http.StatusBadGateway)
 			return
 		}
@@ -775,7 +778,9 @@ func (p *Proxy) handleAnthropicMessages() http.HandlerFunc {
 				requestLogger.Warn("Client disconnected during /v1/messages upstream body read: %v", r.Context().Err())
 				return
 			}
-			p.logRequest(chatReq, modelName, "messages", start, resp.StatusCode, nil, false, err.Error(), nil, requestLogger)
+			sessionID := fmt.Sprintf("session_%s", modelName)
+			conversationMessages, systemPrompt, turnIndex, conversationID := p.extractAndUpdateConversation(sessionID, anthropicReq, modelName)
+			p.logRequestFull(anthropicReq, conversationMessages, systemPrompt, sessionID, conversationID, turnIndex, modelName, "messages", start, resp.StatusCode, nil, nil, false, err.Error(), nil, requestLogger)
 			http.Error(w, "Failed to read response", http.StatusBadGateway)
 			return
 		}
@@ -793,7 +798,10 @@ func (p *Proxy) handleAnthropicMessages() http.HandlerFunc {
 		}
 
 		tokensUsed := p.extractTokens(openAIResp)
-		p.logRequest(chatReq, modelName, "messages", start, resp.StatusCode, normalizedBody, false, "", tokensUsed, requestLogger)
+		// Extract conversation context and log with full context (not just simplified logRequest)
+		sessionID := fmt.Sprintf("session_%s", modelName)
+		conversationMessages, systemPrompt, turnIndex, conversationID := p.extractAndUpdateConversation(sessionID, anthropicReq, modelName)
+		p.logRequestFull(anthropicReq, conversationMessages, systemPrompt, sessionID, conversationID, turnIndex, modelName, "messages", start, resp.StatusCode, normalizedBody, nil, false, "", tokensUsed, requestLogger)
 
 		textContent := ""
 		thinkingContent := ""
@@ -1308,8 +1316,10 @@ func (p *Proxy) handleAnthropicMessagesStream(w http.ResponseWriter, r *http.Req
 			"output_tokens": outputTokens,
 		},
 	}
-	respBytes, _ := json.Marshal(respForLog)
-	p.logRequest(chatReq, modelName, "messages", start, resp.StatusCode, respBytes, true, "", usage, requestLogger)
+	// Extract conversation context and log with full context
+	sessionID := fmt.Sprintf("session_%s_stream", modelName)
+	conversationMessages, systemPrompt, turnIndex, conversationID := p.extractAndUpdateConversation(sessionID, chatReq, modelName)
+	p.logRequestFull(chatReq, conversationMessages, systemPrompt, sessionID, conversationID, turnIndex, modelName, "messages", start, resp.StatusCode, nil, respForLog, true, "", usage, requestLogger)
 }
 
 // fixAnthropicThinkingBlocksForPassthrough 检查 Anthropic 请求中助手消息是否缺 thinking 块，

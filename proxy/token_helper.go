@@ -28,83 +28,61 @@ func extractJSONFromLine(line []byte) []byte {
 	return nil
 }
 
-// extractTokenFromChunk extracts token counts from a single SSE chunk (parsed JSON).
-// It accumulates into the provided tokens map (pass a new map on first call).
-// Handles three formats:
-//   - OpenAI:   {"usage":{"prompt_tokens":N,"completion_tokens":M,"total_tokens":T}}
-//   - llama.cpp timings: {"timings":{"prompt_n":N,"predicted_n":M,"total":T}}
-//   - Anthropic: {"usage":{"input_tokens":N,"output_tokens":M}}
+// extractTokenFromChunk updates the provided tokens map from a single SSE chunk.
 //
-// @note  For each dimension (prompt/completion/total), only the first
-//       available field name is used to avoid double-counting when an
-//       upstream returns both canonical and legacy names.
+// Behavior depends on chunk format:
+//   - OpenAI usage:  each chunk's usage contains the **cumulative** token count
+//     for the entire stream so far. When usage is present, we overwrite (take max)
+//     rather than accumulate to avoid double-counting.
+//   - llama.cpp timings: timings appear on every chunk with cumulative counts.
+//     We take the max of the existing accumulated value and the new value.
+//   - Anthropic usage: same as OpenAI — overwrite with max.
+//
+// @param tokens   map to update (created on first call if nil).
+// @param chunk    parsed JSON from a single SSE chunk.
+//
+// @note  For standard usage objects, OpenAI/Anthropic/llama.cpp all return
+//       cumulative counts per chunk. Taking the max across chunks yields the
+//       final total without double-counting.
 //
 // @note  llama.cpp timings are read ONLY when usage is absent.
-//       In streaming, timings appear on EVERY chunk with cumulative counts.
-//       We accumulate them here; normalizeStreamChunk also converts timings->usage
-//       for the wire format, but that normalized copy is not fed back into
-//       this function, so direct timings handling is required.
 func extractTokenFromChunk(tokens map[string]int, chunk map[string]interface{}) {
 	if tokens == nil {
 		tokens = make(map[string]int)
 	}
 
-	// --- Path 1: Standard usage object (OpenAI / normalized llama.cpp) ---
+	// --- Path 1: Standard usage object (OpenAI / normalized llama.cpp / Anthropic) ---
 	if usageRaw, exists := chunk["usage"]; exists {
 		if u, ok := usageRaw.(map[string]interface{}); ok {
-			// Prompt tokens: prefer prompt_tokens (OpenAI standard), fall back to input_tokens
-			if val, exists := u["prompt_tokens"]; exists {
-				if v, ok := asInt(val); ok {
-					tokens["prompt_tokens"] += v
-				}
-			} else if val, exists := u["input_tokens"]; exists {
-				if v, ok := asInt(val); ok {
-					tokens["prompt_tokens"] += v
-				}
-			}
-			// Completion tokens: prefer completion_tokens (OpenAI standard), fall back to output_tokens
-			if val, exists := u["completion_tokens"]; exists {
-				if v, ok := asInt(val); ok {
-					tokens["completion_tokens"] += v
-				}
-			} else if val, exists := u["output_tokens"]; exists {
-				if v, ok := asInt(val); ok {
-					tokens["completion_tokens"] += v
-				}
-			}
-			// Total tokens: only one canonical name
-			if val, exists := u["total_tokens"]; exists {
-				if v, ok := asInt(val); ok {
-					tokens["total_tokens"] += v
-				}
-			}
+			updateTokenMax(tokens, "prompt_tokens", u, "prompt_tokens", "input_tokens")
+			updateTokenMax(tokens, "completion_tokens", u, "completion_tokens", "output_tokens")
+			updateTokenMax(tokens, "total_tokens", u, "total_tokens")
 			return // usage found — do not also read timings
 		}
 	}
 
 	// --- Path 2: llama.cpp raw timings (fallback when no usage object) ---
-	// llama.cpp streaming chunks carry cumulative token counts in timings:
-	//   {"timings":{"prompt_n":100.5,"predicted_n":50.2,"total":150.7,"prompt_per_second":0.98}}
 	if timingsRaw, exists := chunk["timings"]; exists {
 		if t, ok := timingsRaw.(map[string]interface{}); ok {
-			// prompt_n → prompt_tokens
-			if val, exists := t["prompt_n"]; exists {
-				if v, ok := asInt(val); ok {
-					tokens["prompt_tokens"] += v
+			updateTokenMax(tokens, "prompt_tokens", t, "prompt_n")
+			updateTokenMax(tokens, "completion_tokens", t, "predicted_n")
+			updateTokenMax(tokens, "total_tokens", t, "total")
+		}
+	}
+}
+
+// updateTokenMax reads numeric values from src using the given key names (in priority order)
+// and updates tokens[key] to the maximum of its current value and the new value.
+// This is the core helper for both accumulate-mode (+) and max-mode (=) token extraction.
+func updateTokenMax(tokens map[string]int, key string, src map[string]interface{}, names ...string) {
+	for _, name := range names {
+		if val, exists := src[name]; exists {
+			if v, ok := asInt(val); ok {
+				if v > tokens[key] {
+					tokens[key] = v
 				}
 			}
-			// predicted_n → completion_tokens
-			if val, exists := t["predicted_n"]; exists {
-				if v, ok := asInt(val); ok {
-					tokens["completion_tokens"] += v
-				}
-			}
-			// total → total_tokens (if present as a number)
-			if val, exists := t["total"]; exists {
-				if v, ok := asInt(val); ok {
-					tokens["total_tokens"] += v
-				}
-			}
+			return // use first available field name only
 		}
 	}
 }
